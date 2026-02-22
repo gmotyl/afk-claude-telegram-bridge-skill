@@ -162,12 +162,18 @@ def cmd_setup():
 
     # ─── Step 3: Fetch Available Chats ────────────────────────────────────────
     print()
-    print("🔍 STEP 3: Finding your chats...")
-    chats = _fetch_available_chats(token)
+    print("🔍 STEP 3: Finding your admin groups...")
+    all_chats = _fetch_available_chats(token)
 
-    if not chats:
+    # Filter to only groups (where bot should be admin)
+    admin_groups = {
+        cid: info for cid, info in all_chats.items()
+        if info["type"] == "group"
+    }
+
+    if not admin_groups:
         print()
-        print("❌ No chats found. Make sure you:")
+        print("❌ No groups found. Make sure you:")
         print("   • Sent a message in the group where the bot is an admin")
         print("   • Enabled TOPICS in the group")
         print("   • Waited a moment for the message to process")
@@ -184,27 +190,35 @@ def cmd_setup():
             print("✓ Config saved (manual mode)")
         return
 
-    # ─── Step 4: Select Chat ──────────────────────────────────────────────────
-    print()
-    print("✓ Found available chats:")
-    print()
-    chat_list = sorted(chats.items())
-    for idx, (chat_id, info) in enumerate(chat_list, 1):
-        chat_type_emoji = "👥" if info["type"] == "group" else "👤"
-        print(f"  {idx}. {chat_type_emoji} {info['title']} (ID: {chat_id})")
+    # Auto-select if only one group, otherwise ask user
+    chat_list = sorted(admin_groups.items())
 
-    print()
-    while True:
-        try:
-            choice = input("Select chat (enter number): ").strip()
-            idx = int(choice) - 1
-            if 0 <= idx < len(chat_list):
-                selected_chat_id, selected_info = chat_list[idx]
-                break
-            else:
-                print("❌ Invalid selection. Try again.")
-        except ValueError:
-            print("❌ Please enter a valid number.")
+    if len(chat_list) == 1:
+        # Auto-use the only admin group
+        selected_chat_id, selected_info = chat_list[0]
+        print()
+        print(f"✓ Found your admin group: {selected_info['title']}")
+        print(f"  Using: {selected_chat_id}")
+    else:
+        # Multiple groups — let user choose
+        print()
+        print("✓ Found available admin groups:")
+        print()
+        for idx, (chat_id, info) in enumerate(chat_list, 1):
+            print(f"  {idx}. 👥 {info['title']} (ID: {chat_id})")
+
+        print()
+        while True:
+            try:
+                choice = input("Select group (enter number): ").strip()
+                idx = int(choice) - 1
+                if 0 <= idx < len(chat_list):
+                    selected_chat_id, selected_info = chat_list[idx]
+                    break
+                else:
+                    print("❌ Invalid selection. Try again.")
+            except ValueError:
+                print("❌ Please enter a valid number.")
 
     config["chat_id"] = selected_chat_id
 
