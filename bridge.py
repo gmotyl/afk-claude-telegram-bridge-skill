@@ -69,6 +69,14 @@ class TelegramAPI:
         }
         return self._request("createForumTopic", data)
 
+    def delete_forum_topic(self, thread_id):
+        """Usuwa wątek (Topic) z Grupy Telegrama"""
+        data = {
+            "chat_id": self.chat_id,
+            "message_thread_id": thread_id
+        }
+        return self._request("deleteForumTopic", data)
+
     def send_message(self, text, thread_id=None, reply_markup=None, parse_mode="HTML"):
         data = {
             "chat_id": self.chat_id,
@@ -301,8 +309,14 @@ class BridgeDaemon:
             self.tg.send_message(f"📡 <b>AFK Activated</b>\nProject: {escape_html(project)}", thread_id=thread_id)
 
         elif etype == "deactivation":
-            self.tg.send_message(f"👋 <b>AFK Deactivated</b>", thread_id=thread_id)
+            # Send deactivation message first (if thread exists)
+            if thread_id:
+                self.tg.send_message(f"👋 <b>AFK Deactivated</b>", thread_id=thread_id)
+
+            # Delete the forum topic
             if session_id in self.session_threads:
+                topic_id = self.session_threads[session_id]
+                self.tg.delete_forum_topic(topic_id)
                 del self.session_threads[session_id]
 
         elif etype == "permission_request":
