@@ -299,7 +299,7 @@ class BridgeDaemon:
         if etype == "activation":
             # 1. Tworzymy nowy Topic dla tej sesji
             project = event.get("project", "Unknown")
-            topic_name = f"S{slot} - {project[:15]}"
+            topic_name = event.get("topic_name", f"S{slot} - {project[:15]}")
             res = self.tg.create_forum_topic(topic_name)
 
             if res and res.get("ok"):
