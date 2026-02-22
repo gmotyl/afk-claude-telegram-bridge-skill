@@ -29,7 +29,7 @@ Perfect for: working on the go, meetings, or just stepping away while keeping Cl
 ## Quick Install
 
 ```bash
-npx skills add gmotyl/afk-claude-telegram-bridge-skill --skill afk
+npx skills add gmotyl/afk-claude-telegram-bridge-skill --skill afk-claude-telegram-bridge
 ```
 
 Or with curl:
