@@ -29,7 +29,13 @@ Perfect for: working on the go, meetings, or just stepping away while keeping Cl
 - Bot added to the group as **Administrator**
 - Group chat ID (starts with `-100...`)
 
-## Quick Start
+## Quick Start (One-Liner)
+
+```bash
+git clone https://github.com/gmotyl/afk-claude-telegram-bridge.git && cd afk-claude-telegram-bridge && ./setup.sh
+```
+
+Or if you prefer manual installation:
 
 ### 1. Clone or Copy
 
