@@ -437,8 +437,14 @@ def cmd_deactivate(session_id):
             }
             with open(event_file, "a") as f:
                 f.write(json.dumps(event) + "\n")
-            # Give daemon time to scan and process the deactivation event
-            time.sleep(1.5)
+
+            # Wait for daemon to process deactivation (poll for marker file)
+            processed_path = os.path.join(ipc_session_dir, "deactivation_processed")
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if os.path.exists(processed_path):
+                    break
+                time.sleep(0.3)
 
         # NOW remove the slot from state.json (after daemon has processed the event)
         del slots[removed_slot]
@@ -501,6 +507,41 @@ def send_response_to_telegram(text):
 
 # ─── Hook Mode ───────────────────────────────────────────────────────────────
 
+def _find_bound_session(session_id):
+    """Find IPC dir where this session_id is bound."""
+    if not os.path.isdir(IPC_DIR):
+        return None
+    for dirname in os.listdir(IPC_DIR):
+        dirpath = os.path.join(IPC_DIR, dirname)
+        bound_file = os.path.join(dirpath, "bound_session")
+        if os.path.isfile(bound_file):
+            try:
+                with open(bound_file) as f:
+                    if f.read().strip() == session_id:
+                        return dirpath
+            except OSError:
+                pass
+    return None
+
+
+def _find_unbound_slots():
+    """Find IPC dirs that don't have a bound_session file yet."""
+    if not os.path.isdir(IPC_DIR):
+        return []
+    unbound = []
+    for dirname in os.listdir(IPC_DIR):
+        dirpath = os.path.join(IPC_DIR, dirname)
+        if os.path.isdir(dirpath) and not os.path.isfile(os.path.join(dirpath, "bound_session")):
+            unbound.append(dirpath)
+    return unbound
+
+
+def _bind_session(ipc_dir, session_id):
+    """Bind a Claude session_id to an IPC directory."""
+    with open(os.path.join(ipc_dir, "bound_session"), "w") as f:
+        f.write(session_id)
+
+
 def cmd_hook():
     event_data = json.load(sys.stdin)
     session_id = event_data.get("session_id", "")
@@ -511,24 +552,28 @@ def cmd_hook():
 
     ipc_session_dir = os.path.join(IPC_DIR, session_id)
 
-    # If exact session_id dir doesn't exist, check for single active AFK session (single-session mode)
-    if not os.path.isdir(ipc_session_dir):
-        try:
-            active_sessions = [d for d in os.listdir(IPC_DIR) if os.path.isdir(os.path.join(IPC_DIR, d))]
-            if len(active_sessions) == 1:
-                # Single session mode: use whatever session is active, regardless of session_id
-                ipc_session_dir = os.path.join(IPC_DIR, active_sessions[0])
-                log.info(f"[SINGLE-SESSION MODE] Using active session {active_sessions[0]} for hook event {hook_event}")
+    if os.path.isdir(ipc_session_dir):
+        # Direct match — this session IS the AFK session
+        pass
+    else:
+        # Check if this session_id is bound to an existing IPC dir
+        bound_dir = _find_bound_session(session_id)
+        if bound_dir:
+            ipc_session_dir = bound_dir
+            log.debug(f"[BOUND] Session {session_id} bound to {bound_dir}")
+        else:
+            # Check for unbound slots — bind on first contact
+            unbound = _find_unbound_slots()
+            if len(unbound) == 1:
+                _bind_session(unbound[0], session_id)
+                ipc_session_dir = unbound[0]
+                log.info(f"[BIND] Bound session {session_id} to {os.path.basename(unbound[0])}")
             else:
-                # Multiple sessions or none — not in AFK mode
-                log.debug(f"Not in AFK mode: {len(active_sessions)} active sessions")
+                # Zero or multiple unbound — not our session, exit silently
+                log.debug(f"Not in AFK mode for session {session_id} ({len(unbound)} unbound slots)")
                 sys.exit(0)
-        except Exception as e:
-            log.error(f"Error checking active sessions: {e}")
-            sys.exit(0)
 
     if not os.path.isdir(ipc_session_dir):
-        # Still no AFK session
         sys.exit(0)
 
     config = load_config()
@@ -616,33 +661,35 @@ def cmd_hook():
 
     # ── Stop ──
     elif hook_event == "Stop":
-        # Prevent infinite loop: if stop_hook_active, let Claude stop
-        if event_data.get("stop_hook_active", False):
-            sys.exit(0)
+        stop_hook_active = event_data.get("stop_hook_active", False)
 
         event_id = str(uuid.uuid4())[:8]
         last_msg = event_data.get("last_assistant_message", "")
         # Truncate for Telegram (max ~4000 chars)
-        if len(last_msg) > 800:
-            last_msg = last_msg[:800] + "..."
+        if len(last_msg) > 2000:
+            last_msg = last_msg[:2000] + "..."
 
         event = {
             "id": event_id,
             "type": "stop",
             "last_message": last_msg,
             "session_id": session_id,
+            "stop_hook_active": stop_hook_active,
             "timestamp": time.time(),
         }
         event_file = os.path.join(ipc_session_dir, "events.jsonl")
         with open(event_file, "a") as f:
             f.write(json.dumps(event) + "\n")
+        log.info(f"[STOP] Wrote event {event_id} (stop_hook_active={stop_hook_active})")
 
-        # Poll for Greg's next instruction
+        # Always poll for next instruction — keeps the Telegram conversation chain alive.
+        # The daemon handles stop_hook_active stops by forwarding the response first,
+        # then creating a pending event for the next instruction.
         timeout = config.get("stop_timeout", 600)
         response = _poll_response(ipc_session_dir, event_id, timeout)
 
         if response and response.get("instruction"):
-            # Block the stop and inject Greg's instruction
+            # Block the stop and inject instruction
             result = {
                 "decision": "block",
                 "reason": response["instruction"],

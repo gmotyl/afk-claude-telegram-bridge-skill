@@ -295,20 +295,25 @@ class BridgeDaemon:
         etype = event.get("type", "")
         event_id = event.get("id", "")
         thread_id = self.session_threads.get(session_id)
+        log.info(f"[EVENT] Processing {etype} (id={event_id}) for session {session_id[:8]}... thread={thread_id}")
 
         if etype == "activation":
-            # 1. Tworzymy nowy Topic dla tej sesji
             project = event.get("project", "Unknown")
             topic_name = event.get("topic_name", f"S{slot} - {project[:15]}")
+            log.info(f"[ACTIVATION] Creating topic '{topic_name}' for {project}")
             res = self.tg.create_forum_topic(topic_name)
 
             if res and res.get("ok"):
                 thread_id = res["result"]["message_thread_id"]
                 self.session_threads[session_id] = thread_id
+                log.info(f"[ACTIVATION] Topic created: thread_id={thread_id}")
+            else:
+                log.error(f"[ACTIVATION] Failed to create topic: {res}")
 
             self.tg.send_message(f"📡 <b>AFK Activated</b>\nProject: {escape_html(project)}", thread_id=thread_id)
 
         elif etype == "deactivation":
+            log.info(f"[DEACTIVATION] Processing for session {session_id[:8]}...")
             # Send deactivation message first (if thread exists)
             if thread_id:
                 self.tg.send_message(f"👋 <b>AFK Deactivated</b>", thread_id=thread_id)
@@ -316,8 +321,17 @@ class BridgeDaemon:
             # Delete the forum topic
             if session_id in self.session_threads:
                 topic_id = self.session_threads[session_id]
+                log.info(f"[DEACTIVATION] Deleting topic {topic_id}")
                 self.tg.delete_forum_topic(topic_id)
                 del self.session_threads[session_id]
+
+            # Signal that deactivation was processed
+            processed_path = IPC_DIR / session_id / "deactivation_processed"
+            try:
+                with open(processed_path, "w") as f:
+                    f.write("done")
+            except OSError:
+                pass
 
         elif etype == "permission_request":
             text = format_permission_message(event, slot)
@@ -330,9 +344,45 @@ class BridgeDaemon:
                     "message_id": result["result"]["message_id"],
                     "slot": slot
                 }
+                log.info(f"[PERMISSION] Sent to Telegram, msg_id={result['result']['message_id']}")
+            else:
+                log.error(f"[PERMISSION] Failed to send: {result}")
 
         elif etype == "stop":
-            text = format_stop_message(event, slot)
+            is_response = event.get("stop_hook_active", False)
+
+            # If this is a response to a Telegram instruction, forward the response first
+            if is_response:
+                last_msg = event.get("last_message", "").strip()
+                if last_msg:
+                    text = f"🤖 {escape_html(last_msg)}"
+                    self.tg.send_message(text, thread_id=thread_id)
+                    log.info(f"[STOP] Forwarded response to Telegram (stop_hook_active)")
+                # Fall through to normal stop handling — create pending event
+                # so the next Telegram message gets routed as the next instruction
+
+            # Check for queued instruction — auto-inject if available
+            queued_path = IPC_DIR / session_id / "queued_instruction.json"
+            if queued_path.exists():
+                try:
+                    with open(queued_path) as f:
+                        queued = json.load(f)
+                    instruction = queued.get("instruction", "").strip()
+                    if instruction:
+                        self._write_response(IPC_DIR / session_id, event_id, {"instruction": instruction})
+                        queued_path.unlink()
+                        text = f"▶️ Auto-continuing with queued instruction:\n<i>{escape_html(instruction[:300])}</i>"
+                        self.tg.send_message(text, thread_id=thread_id)
+                        log.info(f"[STOP] Auto-injected queued instruction: {instruction[:80]}")
+                        return
+                except Exception as e:
+                    log.error(f"[STOP] Error reading queued instruction: {e}")
+
+            if is_response:
+                # Response already forwarded above — just show the prompt
+                text = f"<i>Reply to give next instruction...</i>"
+            else:
+                text = format_stop_message(event, slot)
             kb = stop_keyboard(event_id)
             result = self.tg.send_message(text, thread_id=thread_id, reply_markup=kb)
             if result and result.get("ok"):
@@ -342,16 +392,17 @@ class BridgeDaemon:
                     "message_id": result["result"]["message_id"],
                     "slot": slot
                 }
+                log.info(f"[STOP] Sent to Telegram, msg_id={result['result']['message_id']}")
+            else:
+                log.error(f"[STOP] Failed to send: {result}")
 
         elif etype == "notification":
             text = format_notification_message(event, slot)
             self.tg.send_message(text, thread_id=thread_id)
 
         elif etype == "response":
-            # Forward Claude's response back to Telegram
             response_text = event.get("text", "").strip()
             if response_text:
-                # Truncate if too long
                 if len(response_text) > 3000:
                     response_text = response_text[:2900] + "\n...(truncated)"
                 self.tg.send_message(f"🤖 {response_text}", thread_id=thread_id)
