@@ -1,6 +1,6 @@
 ---
 name: afk-claude-telegram-bridge
-description: Remote-control Claude Code sessions from your phone via Telegram when AFK. Approve tool calls, send instructions, multi-session support.
+description: Remote-control Claude Code from Telegram when AFK. Telegram Topics for session routing, message buffer, approve tool calls, no prefix needed.
 ---
 
 # AFK Claude Telegram Bridge
