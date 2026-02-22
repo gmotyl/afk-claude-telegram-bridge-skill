@@ -9,17 +9,25 @@ You're working on code with Claude Code, but you need to leave your desk or clos
 - **Approve tool calls** from your phone (Write, Bash, Edit, etc.)
 - **Continue working** by sending new instructions when Claude finishes a task
 - **Monitor progress** via Telegram notifications
-- **Run multiple sessions** concurrently (S1-S4)
+- **Run multiple sessions** concurrently with automatic topic routing
 
 Perfect for: working on the go, meetings, or just stepping away while keeping Claude running.
 
 ## Features
 
 - 🔐 Permission approval via Telegram inline keyboards
-- 📱 Send new instructions from your phone
+- 📂 **Telegram Topics** — Each session gets its own topic/thread in a Telegram group
+- 🚫 **No prefixes needed** — Just type in the topic, bot knows which session to send to
+- 📥 **Message Buffer** — Queue instructions while Claude is working, delivered when task completes
 - 🤖 Auto-approve read-only tools (Read, Glob, Grep, WebSearch, WebFetch)
 - 👥 Multi-session support (up to 4 concurrent sessions)
 - 📦 Zero Python dependencies (stdlib only)
+
+## ⚠️ Requirements
+
+- **Telegram Group** (not private chat) with Topics enabled
+- Bot added to the group as **Administrator**
+- Group chat ID (starts with `-100...`)
 
 ## Quick Start
 
@@ -37,21 +45,29 @@ cp -r afk-claude-telegram-bridge/* ~/.claude/hooks/telegram-bridge/
 3. Name it "Claude Bridge" (or your preference)
 4. Copy the bot token
 
-### 3. Get Your Chat ID
+### 3. Create a Telegram Group
 
-1. Send any message to your new bot
-2. Visit: `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
-3. Find `"chat":{"id":123456789}` — that's your chat_id
+1. Create a new group in Telegram
+2. Add your bot to the group
+3. **Make bot an Administrator**
+4. **Enable Topics** in group settings
+5. Send a message to the group
 
-### 4. Configure
+### 4. Get Your Group Chat ID
+
+1. Visit: `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
+2. Find `"chat":{"id":-100...}` — that's your group chat_id (starts with -100)
+3. Copy the full ID (including the -100 prefix)
+
+### 5. Configure
 
 ```bash
 ~/.claude/hooks/telegram-bridge/hook.sh --setup
 ```
 
-Enter your bot token and chat ID when prompted.
+Enter your bot token and the group chat ID (starts with -100).
 
-### 5. Add Hooks
+### 6. Add Hooks
 
 Edit `~/.claude/settings.json`:
 
@@ -74,7 +90,7 @@ Edit `~/.claude/settings.json`:
 }
 ```
 
-### 6. Create Commands
+### 7. Create Commands
 
 `~/.claude/commands/afk.md`:
 ```markdown
@@ -94,38 +110,48 @@ Disable AFK mode and return to local control.
 /back
 ```
 
+## How It Works
+
+### Auto-Topics
+When you activate `/afk`, the bot automatically creates a new Topic in your Telegram group (e.g., "S1 - myproject"). All communication for that session happens in that topic.
+
+### Smart Routing
+No need to type "S1: do this". Just open the topic and type your instruction — the bot knows which session it belongs to.
+
+### Message Buffer
+If Claude is still working on a task and you send multiple instructions, the bot queues them and delivers all at once when Claude finishes the current task.
+
 ## Usage
 
 ### Activate
 ```
 /afk
 ```
-Telegram confirms: "📡 S1 — AFK Activated"
+Bot creates a new topic: "S1 - projectname"
 
 ### While Away
 
-When Claude needs approval:
+When Claude needs approval (in the topic):
 ```
-🔐 S1 — Permission Request
+🔐 Permission Request
 Tool: Bash
 `npm install express`
 [✅ Approve] [❌ Deny]
 ```
 
-When task completes:
+When task completes (in the topic):
 ```
-✅ S1 — Task Complete
+✅ Task Complete
 I've implemented the login form...
 [🛑 Let it stop]
 ```
 
-Reply with instructions to continue, or tap "Let it stop".
+**Just reply with instructions** — no prefix needed!
 
-### Multi-Session
-```
-S1: add unit tests
-S2: push to remote
-```
+### Multiple Sessions
+Each session automatically gets its own topic:
+- Session 1 → Topic "S1 - projectname"
+- Session 2 → Topic "S2 - anotherproject"
 
 ### Deactivate
 ```
@@ -154,7 +180,8 @@ S2: push to remote
 - Python 3 (stdlib only)
 - bash
 - Telegram bot token
-- Claude Code
+- Telegram group with Topics enabled
+- Bot must be group administrator
 
 ## Credits
 

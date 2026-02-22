@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 """
 telegram-bridge bridge.py — Telegram long-polling daemon.
-
-Watches ipc/{session_id}/events.jsonl for new events from hooks,
-sends formatted messages to Telegram with inline keyboards,
-handles callback queries and text messages, writes response files.
-
-Self-terminates when the last session deactivates.
-Uses only Python stdlib (urllib.request, json).
+Wersja z obsługą Telegram Topics (Wątków) oraz Kolejkowaniem Wiadomości (Message Buffer).
 """
-
 import json
 import logging
 import os
@@ -26,9 +19,9 @@ CONFIG_PATH = BRIDGE_DIR / "config.json"
 STATE_PATH = BRIDGE_DIR / "state.json"
 IPC_DIR = BRIDGE_DIR / "ipc"
 
-HEARTBEAT_INTERVAL = 30  # seconds
-POLL_TIMEOUT = 30  # Telegram long-poll timeout
-EVENT_SCAN_INTERVAL = 0.5  # seconds between IPC scans
+HEARTBEAT_INTERVAL = 30
+POLL_TIMEOUT = 30
+EVENT_SCAN_INTERVAL = 0.5
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -43,8 +36,6 @@ log = logging.getLogger("bridge")
 
 
 class TelegramAPI:
-    """Minimal Telegram Bot API client using urllib."""
-
     def __init__(self, token, chat_id):
         self.token = token
         self.chat_id = str(chat_id)
@@ -70,12 +61,22 @@ class TelegramAPI:
             log.warning("Unexpected error on %s: %s", method, e)
             return None
 
-    def send_message(self, text, reply_markup=None, parse_mode="HTML"):
+    def create_forum_topic(self, name):
+        """Tworzy nowy wątek (Topic) w Grupie Telegrama"""
+        data = {
+            "chat_id": self.chat_id,
+            "name": name
+        }
+        return self._request("createForumTopic", data)
+
+    def send_message(self, text, thread_id=None, reply_markup=None, parse_mode="HTML"):
         data = {
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": parse_mode,
         }
+        if thread_id:
+            data["message_thread_id"] = thread_id
         if reply_markup:
             data["reply_markup"] = reply_markup
         return self._request("sendMessage", data)
@@ -114,7 +115,6 @@ class TelegramAPI:
 
 # ─── State helpers ───────────────────────────────────────────────────────────
 
-
 def load_config():
     try:
         with open(CONFIG_PATH) as f:
@@ -144,7 +144,6 @@ def get_slot_for_session(state, session_id):
 
 
 def get_active_sessions(state):
-    """Return dict of session_id → slot_num for all active sessions."""
     sessions = {}
     for slot_num, info in state.get("slots", {}).items():
         sid = info.get("session_id")
@@ -155,99 +154,57 @@ def get_active_sessions(state):
 
 # ─── Message formatting ─────────────────────────────────────────────────────
 
-
 def escape_html(text):
-    """Escape HTML special chars for Telegram HTML parse mode."""
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def format_permission_message(event, slot):
     tool = event.get("tool_name", "?")
     desc = event.get("description", "")
-    desc_escaped = escape_html(desc)
-
-    return (
-        f"🔐 <b>S{slot} — Permission Request</b>\n\n"
-        f"<b>Tool:</b> {escape_html(tool)}\n"
-        f"<pre>{desc_escaped}</pre>"
-    )
+    return f"🔐 <b>Permission Request</b>\n\n<b>Tool:</b> {escape_html(tool)}\n\n<pre>{escape_html(desc)}</pre>"
 
 
 def format_stop_message(event, slot):
-    project = event.get("project", "")
     last_msg = event.get("last_message", "")
     if last_msg:
         last_msg = escape_html(last_msg)
         if len(last_msg) > 600:
             last_msg = last_msg[:600] + "..."
-    return (
-        f"✅ <b>S{slot} — Task Complete</b>\n\n"
-        f"{last_msg}\n\n"
-        f"<i>Reply with next instruction or let it timeout to stop.</i>"
-    )
+    return f"✅ <b>Task Complete</b>\n\n{last_msg}\n\n<i>Reply to give next instruction...</i>"
 
 
 def format_notification_message(event, slot):
     ntype = event.get("notification_type", "")
     msg = escape_html(event.get("message", ""))
     title = escape_html(event.get("title", ""))
-
     emoji = {"permission_prompt": "🔔", "idle_prompt": "💤"}.get(ntype, "📢")
-    return f"{emoji} <b>S{slot}</b> — {title}\n{msg}"
-
-
-def format_activation_message(event):
-    slot = event.get("slot", "?")
-    project = event.get("project", "unknown")
-    return f"📡 <b>S{slot} — AFK Activated</b>\nProject: {escape_html(project)}"
-
-
-def format_deactivation_message(event):
-    slot = event.get("slot", "?")
-    return f"👋 <b>S{slot} — AFK Deactivated</b>"
+    return f"{emoji} {title}\n{msg}"
 
 
 def permission_keyboard(event_id):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "✅ Approve", "callback_data": f"allow:{event_id}"},
-                {"text": "❌ Deny", "callback_data": f"deny:{event_id}"},
-            ]
-        ]
-    }
+    return {"inline_keyboard": [
+        [{"text": "✅ Approve", "callback_data": f"allow:{event_id}"},
+         {"text": "❌ Deny", "callback_data": f"deny:{event_id}"}]
+    ]}
 
 
 def stop_keyboard(event_id):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🛑 Let it stop", "callback_data": f"stop:{event_id}"},
-            ]
-        ]
-    }
+    return {"inline_keyboard": [
+        [{"text": "🛑 Let it stop", "callback_data": f"stop:{event_id}"}]
+    ]}
 
 
 # ─── Daemon ──────────────────────────────────────────────────────────────────
-
 
 class BridgeDaemon:
     def __init__(self):
         self.config = load_config()
         self.tg = TelegramAPI(self.config["bot_token"], self.config["chat_id"])
         self.running = True
-        # Track file positions for each session's events.jsonl
         self.event_positions = {}
-        # Map event_id → {session_id, type, message_id (telegram)}
         self.pending_events = {}
-        # Map slot → session_id for text routing
-        self.slot_sessions = {}
-        # "Active reply target" — last session that sent a stop event
-        self.reply_target_session = None
+        # Pamięć: session_id -> message_thread_id (Topic ID)
+        self.session_threads = {}
 
         signal.signal(signal.SIGTERM, self._handle_sigterm)
         signal.signal(signal.SIGINT, self._handle_sigterm)
@@ -258,27 +215,20 @@ class BridgeDaemon:
 
     def run(self):
         log.info("Bridge daemon starting")
-
-        # Flush any pending Telegram updates (skip old messages)
         self.tg.get_updates(timeout=0)
 
-        last_heartbeat = 0
-        last_event_scan = 0
-
+        last_heartbeat, last_event_scan = 0, 0
         while self.running:
             now = time.time()
 
-            # Heartbeat
             if now - last_heartbeat > HEARTBEAT_INTERVAL:
                 self._heartbeat()
                 last_heartbeat = now
 
-            # Scan IPC events
             if now - last_event_scan > EVENT_SCAN_INTERVAL:
                 self._scan_events()
                 last_event_scan = now
 
-            # Poll Telegram (this blocks for up to POLL_TIMEOUT seconds)
             try:
                 updates = self.tg.get_updates(timeout=2)
                 for update in updates:
@@ -287,7 +237,6 @@ class BridgeDaemon:
                 log.error("Error polling Telegram: %s", e)
                 time.sleep(2)
 
-            # Check if any sessions still active
             state = load_state()
             if not state.get("slots"):
                 log.info("No active sessions, shutting down")
@@ -300,28 +249,21 @@ class BridgeDaemon:
             state = load_state()
             state["daemon_heartbeat"] = time.time()
             save_state(state)
-        except Exception as e:
-            log.warning("Heartbeat failed: %s", e)
+        except Exception:
+            pass
 
     def _scan_events(self):
-        """Read new events from all active sessions' events.jsonl files."""
         if not IPC_DIR.exists():
             return
 
         state = load_state()
         active = get_active_sessions(state)
 
-        # Update slot_sessions mapping
-        self.slot_sessions = {}
-        for sid, slot in active.items():
-            self.slot_sessions[slot] = sid
-
         for session_id, slot in active.items():
             event_file = IPC_DIR / session_id / "events.jsonl"
             if not event_file.exists():
                 continue
 
-            # Read from last known position
             pos = self.event_positions.get(session_id, 0)
             try:
                 with open(event_file) as f:
@@ -339,60 +281,65 @@ class BridgeDaemon:
                     event = json.loads(line)
                     self._process_event(event, session_id, slot)
                 except json.JSONDecodeError:
-                    log.warning("Invalid JSON in events: %s", line[:100])
+                    pass
 
     def _process_event(self, event, session_id, slot):
         etype = event.get("type", "")
         event_id = event.get("id", "")
+        thread_id = self.session_threads.get(session_id)
 
         if etype == "activation":
-            text = format_activation_message(event)
-            self.tg.send_message(text)
+            # 1. Tworzymy nowy Topic dla tej sesji
+            project = event.get("project", "Unknown")
+            topic_name = f"S{slot} - {project[:15]}"
+            res = self.tg.create_forum_topic(topic_name)
+
+            if res and res.get("ok"):
+                thread_id = res["result"]["message_thread_id"]
+                self.session_threads[session_id] = thread_id
+
+            self.tg.send_message(f"📡 <b>AFK Activated</b>\nProject: {escape_html(project)}", thread_id=thread_id)
 
         elif etype == "deactivation":
-            text = format_deactivation_message(event)
-            self.tg.send_message(text)
+            self.tg.send_message(f"👋 <b>AFK Deactivated</b>", thread_id=thread_id)
+            if session_id in self.session_threads:
+                del self.session_threads[session_id]
 
         elif etype == "permission_request":
             text = format_permission_message(event, slot)
             kb = permission_keyboard(event_id)
-            result = self.tg.send_message(text, reply_markup=kb)
+            result = self.tg.send_message(text, thread_id=thread_id, reply_markup=kb)
             if result and result.get("ok"):
-                msg_id = result["result"]["message_id"]
                 self.pending_events[event_id] = {
                     "session_id": session_id,
                     "type": "permission_request",
-                    "message_id": msg_id,
-                    "slot": slot,
+                    "message_id": result["result"]["message_id"],
+                    "slot": slot
                 }
 
         elif etype == "stop":
             text = format_stop_message(event, slot)
             kb = stop_keyboard(event_id)
-            result = self.tg.send_message(text, reply_markup=kb)
+            result = self.tg.send_message(text, thread_id=thread_id, reply_markup=kb)
             if result and result.get("ok"):
-                msg_id = result["result"]["message_id"]
                 self.pending_events[event_id] = {
                     "session_id": session_id,
                     "type": "stop",
-                    "message_id": msg_id,
-                    "slot": slot,
+                    "message_id": result["result"]["message_id"],
+                    "slot": slot
                 }
-            self.reply_target_session = session_id
 
         elif etype == "notification":
             text = format_notification_message(event, slot)
-            self.tg.send_message(text)
+            self.tg.send_message(text, thread_id=thread_id)
 
     def _handle_update(self, update):
-        """Handle a Telegram update (callback query or text message)."""
         if "callback_query" in update:
             self._handle_callback(update["callback_query"])
         elif "message" in update:
             self._handle_message(update["message"])
 
     def _handle_callback(self, cq):
-        """Handle inline keyboard button press."""
         data = cq.get("data", "")
         cq_id = cq.get("id", "")
 
@@ -409,121 +356,85 @@ class BridgeDaemon:
 
         session_id = pending["session_id"]
         msg_id = pending["message_id"]
-        slot = pending["slot"]
         ipc_session_dir = IPC_DIR / session_id
 
         if action == "allow":
-            # Write allow response
-            response = {"decision": "allow"}
-            self._write_response(ipc_session_dir, event_id, response)
+            self._write_response(ipc_session_dir, event_id, {"decision": "allow"})
             self.tg.answer_callback(cq_id, "Approved")
-            self.tg.edit_message(msg_id, f"✅ <b>S{slot}</b> — Approved")
+            self.tg.edit_message(msg_id, f"✅ Approved")
             del self.pending_events[event_id]
 
         elif action == "deny":
-            response = {"decision": "deny", "message": "Denied via Telegram"}
-            self._write_response(ipc_session_dir, event_id, response)
+            self._write_response(ipc_session_dir, event_id, {"decision": "deny", "message": "Denied via Telegram"})
             self.tg.answer_callback(cq_id, "Denied")
-            self.tg.edit_message(msg_id, f"❌ <b>S{slot}</b> — Denied")
+            self.tg.edit_message(msg_id, f"❌ Denied")
             del self.pending_events[event_id]
 
         elif action == "stop":
-            # Let it stop (write empty response so poll times out or stops cleanly)
-            response = {"instruction": ""}
-            self._write_response(ipc_session_dir, event_id, response)
+            self._write_response(ipc_session_dir, event_id, {"instruction": ""})
             self.tg.answer_callback(cq_id, "Stopping")
-            self.tg.edit_message(msg_id, f"🛑 <b>S{slot}</b> — Stopped")
+            self.tg.edit_message(msg_id, f"🛑 Stopped")
             del self.pending_events[event_id]
-            if self.reply_target_session == session_id:
-                self.reply_target_session = None
 
     def _handle_message(self, msg):
-        """Handle text message from Greg — route to correct session."""
         text = msg.get("text", "").strip()
         chat_id = str(msg.get("chat", {}).get("id", ""))
 
-        # Only accept messages from configured chat
-        if chat_id != self.tg.chat_id:
+        # Wyciągamy ID tematu (wątku) z wiadomości
+        msg_thread_id = msg.get("message_thread_id")
+
+        if chat_id != self.tg.chat_id or not text:
             return
 
-        if not text:
-            return
-
-        # Check for explicit session targeting: "S1: do something"
+        # Szukamy sesji, do której przypisany jest ten konkretny Temat
         target_session = None
-        instruction = text
+        for sid, t_id in self.session_threads.items():
+            if t_id == msg_thread_id:
+                target_session = sid
+                break
 
-        if len(text) > 2 and text[0].upper() == "S" and text[1].isdigit():
-            # Parse "S1: instruction" or "S1 instruction"
-            slot_char = text[1]
-            rest = text[2:].lstrip(": ")
-            if rest:
-                target_session = self.slot_sessions.get(slot_char)
-                instruction = rest
-
-        # If no explicit target, use the last stop event session
-        if not target_session and self.reply_target_session:
-            target_session = self.reply_target_session
-
-        # If still no target, use the only active session (if there's just one)
+        # Fallback - jeśli nie ma topiców, uderz do jedynej aktywnej sesji
         if not target_session:
             state = load_state()
             active = get_active_sessions(state)
             if len(active) == 1:
                 target_session = list(active.keys())[0]
             else:
-                # Ambiguous — ask user to specify
-                slots_info = []
-                for sid, slot in active.items():
-                    slots_info.append(f"S{slot}")
-                self.tg.send_message(
-                    f"Which session? Reply with: <b>S1:</b> your instruction\n"
-                    f"Active: {', '.join(slots_info)}"
-                )
-                return
+                return  # Ignorujemy wiadomości wysłane w głównym czacie, jeśli jest kilka sesji
 
-        if not target_session:
-            self.tg.send_message("No active AFK sessions.")
-            return
+        ipc_session_dir = IPC_DIR / target_session
 
-        # Find pending stop event for this session and write instruction
+        # Szukamy, czy Claude na nas czeka (status "stop")
         stop_event_id = None
         for eid, info in self.pending_events.items():
             if info["session_id"] == target_session and info["type"] == "stop":
                 stop_event_id = eid
                 break
 
-        ipc_session_dir = IPC_DIR / target_session
-
         if stop_event_id:
-            # Respond to the stop event with Greg's instruction
-            response = {"instruction": instruction}
-            self._write_response(ipc_session_dir, stop_event_id, response)
-
-            slot = self.pending_events[stop_event_id]["slot"]
+            # Natychmiastowe wysłanie instrukcji
+            self._write_response(ipc_session_dir, stop_event_id, {"instruction": text})
             msg_id = self.pending_events[stop_event_id]["message_id"]
-            self.tg.edit_message(
-                msg_id,
-                f"▶️ <b>S{slot}</b> — Continuing:\n<i>{escape_html(instruction[:200])}</i>",
-            )
+            self.tg.edit_message(msg_id, f"▶️ Continuing: <i>{escape_html(text[:200])}</i>")
             del self.pending_events[stop_event_id]
-            if self.reply_target_session == target_session:
-                self.reply_target_session = None
-
-            slot_num = get_slot_for_session(load_state(), target_session)
-            self.tg.send_message(f"📨 Sent to S{slot_num or '?'}")
+            self.tg.send_message(f"📨 Wysłano do Agenta", thread_id=msg_thread_id)
         else:
-            # No pending stop — queue instruction as a generic event
-            # The session will pick it up on next stop
-            self.tg.send_message(
-                "⏳ No pending stop event for that session. "
-                "Instruction will be sent when the task completes."
-            )
-            # Write a queued instruction file
+            # MESSAGE BUFFER: Claude pracuje, więc dołączamy to do kolejki
             queued_path = ipc_session_dir / "queued_instruction.json"
+            existing_instruction = ""
+            if queued_path.exists():
+                try:
+                    with open(queued_path, "r") as f:
+                        data = json.load(f)
+                        existing_instruction = data.get("instruction", "") + " "
+                except Exception:
+                    pass
+
+            final_instruction = existing_instruction + text
             try:
                 with open(queued_path, "w") as f:
-                    json.dump({"instruction": instruction, "timestamp": time.time()}, f)
+                    json.dump({"instruction": final_instruction, "timestamp": time.time()}, f)
+                self.tg.send_message(f"📥 Dodano do kolejki instrukcji.", thread_id=msg_thread_id)
             except OSError:
                 pass
 
@@ -536,12 +447,10 @@ class BridgeDaemon:
             log.error("Failed to write response %s: %s", response_path, e)
 
 
-# ─── Main ────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     config = load_config()
     if not config.get("bot_token") or not config.get("chat_id"):
-        print("Bot not configured. Run: hook.sh --setup", file=sys.stderr)
+        print("Bot not configured.", file=sys.stderr)
         sys.exit(1)
 
     daemon = BridgeDaemon()
