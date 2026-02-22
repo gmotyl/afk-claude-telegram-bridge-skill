@@ -26,6 +26,20 @@ Perfect for: working on the go, meetings, or just stepping away while keeping Cl
 - **Multi-session** support (up to 4 concurrent sessions)
 - **Zero dependencies** — Python stdlib only
 
+## Quick Install
+
+```bash
+npx skills add gmotyl/afk-claude-telegram-bridge-skill --skill afk
+```
+
+Or with curl:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gmotyl/afk-claude-telegram-bridge-skill/main/install.sh | bash
+```
+
+Both methods will install hooks, register them in Claude Code, and guide you through Telegram bot setup.
+
 ## Requirements
 
 - Python 3
@@ -33,7 +47,7 @@ Perfect for: working on the go, meetings, or just stepping away while keeping Cl
 - Telegram Group (not private chat) with **Topics enabled**
 - Bot added to the group as **Administrator**
 
-## Installation
+## Manual Installation
 
 ### 1. Create Telegram Bot
 
