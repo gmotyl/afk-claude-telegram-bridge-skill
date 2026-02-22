@@ -119,73 +119,144 @@ def cmd_setup():
     config = load_config()
 
     print("╔══════════════════════════════════════════════╗")
-    print("║   Telegram Bridge Setup                      ║")
+    print("║   Telegram Bridge Setup — Smart Config      ║")
     print("╚══════════════════════════════════════════════╝")
     print()
-    print("Steps to set up your Telegram bot:")
+
+    # ─── Step 1: Bot Token ───────────────────────────────────────────────────
+    print("📝 STEP 1: Bot Token")
     print()
     print("  1. Open Telegram → search @BotFather → /newbot")
     print('  2. Name it "Claude Bridge" (or your preferred name)')
     print("  3. Copy the token that @BotFather provides")
-    print("  4. Visit the bot link from BotFather: t.me/YourBotName")
-    print("  5. Send any message to your bot")
     print()
 
     if config.get("bot_token"):
         print(f"Current bot token: ...{config['bot_token'][-8:]}")
-    token = input("Enter bot token (from @BotFather): ").strip()
+        skip = input("Keep this token? [Y/n]: ").strip().lower()
+        if skip != 'n':
+            token = config["bot_token"]
+        else:
+            token = input("Enter bot token (from @BotFather): ").strip()
+    else:
+        token = input("Enter bot token (from @BotFather): ").strip()
+
     if not token:
-        print("Setup cancelled.")
+        print("❌ Setup cancelled.")
         return
 
     config["bot_token"] = token
 
-    # Try to auto-extract chat_id from getUpdates API
+    # ─── Step 2: Add Bot to Group ─────────────────────────────────────────────
     print()
-    print("Fetching your chat ID from Telegram...")
-    chat_id = _fetch_chat_id(token)
+    print("📱 STEP 2: Add Bot to Group")
+    print()
+    print("  1. Create a Telegram GROUP (not private chat)")
+    print("  2. ADD YOUR BOT to the group (@BotFather gave you a link)")
+    print("  3. Make the bot an ADMIN in the group")
+    print("  4. Enable TOPICS in the group:")
+    print("     • Group settings → Topics (✓ Turn on)")
+    print("  5. Send ANY MESSAGE in the group")
+    print()
+    input("Press Enter when done...")
 
-    if chat_id:
-        print(f"✓ Found chat ID: {chat_id}")
-        confirm = input("Use this chat ID? [Y/n]: ").strip().lower()
-        if confirm != 'n':
-            config["chat_id"] = str(chat_id)
-        else:
-            manual_id = input("Enter chat ID manually: ").strip()
-            if manual_id:
-                config["chat_id"] = manual_id
-    else:
-        print("Could not auto-detect chat ID. Manual entry:")
-        print(f"  • Visit: https://api.telegram.org/bot{token}/getUpdates")
-        print("  • Look for 'chat': {'id': <YOUR_CHAT_ID>}")
-        manual_id = input("Enter chat ID: ").strip()
+    # ─── Step 3: Fetch Available Chats ────────────────────────────────────────
+    print()
+    print("🔍 STEP 3: Finding your chats...")
+    chats = _fetch_available_chats(token)
+
+    if not chats:
+        print()
+        print("❌ No chats found. Make sure you:")
+        print("   • Sent a message in the group where the bot is an admin")
+        print("   • Enabled TOPICS in the group")
+        print("   • Waited a moment for the message to process")
+        print()
+        print("Manual setup:")
+        print(f"   Visit: https://api.telegram.org/bot{token}/getUpdates")
+        print("   Look for 'chat': {'id': <YOUR_CHAT_ID>}")
+        manual_id = input("Enter chat ID manually (or press Enter to cancel): ").strip()
         if manual_id:
             config["chat_id"] = manual_id
+            with open(CONFIG_PATH, "w") as f:
+                json.dump(config, f, indent=2)
+            print()
+            print("✓ Config saved (manual mode)")
+        return
 
+    # ─── Step 4: Select Chat ──────────────────────────────────────────────────
+    print()
+    print("✓ Found available chats:")
+    print()
+    chat_list = sorted(chats.items())
+    for idx, (chat_id, info) in enumerate(chat_list, 1):
+        chat_type_emoji = "👥" if info["type"] == "group" else "👤"
+        print(f"  {idx}. {chat_type_emoji} {info['title']} (ID: {chat_id})")
+
+    print()
+    while True:
+        try:
+            choice = input("Select chat (enter number): ").strip()
+            idx = int(choice) - 1
+            if 0 <= idx < len(chat_list):
+                selected_chat_id, selected_info = chat_list[idx]
+                break
+            else:
+                print("❌ Invalid selection. Try again.")
+        except ValueError:
+            print("❌ Please enter a valid number.")
+
+    config["chat_id"] = selected_chat_id
+
+    # ─── Step 5: Save Config ──────────────────────────────────────────────────
+    print()
+    print("💾 STEP 4: Saving configuration...")
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
 
+    # ─── Step 6: Show Final Config ─────────────────────────────────────────────
     print()
-    print("✓ Config saved!")
+    print("╔══════════════════════════════════════════════╗")
+    print("║   ✓ Setup Complete!                         ║")
+    print("╚══════════════════════════════════════════════╝")
     print()
-    print("Next: Test the bridge with: /afk")
+    print("Configuration:")
+    print(f"  Bot Token:  ...{token[-8:]}")
+    print(f"  Chat:       {selected_info['title']} ({selected_chat_id})")
+    print(f"  Config:     {CONFIG_PATH}")
+    print()
+    print("Ready to use! Next steps:")
+    print("  1. Copy hook files to ~/.claude/hooks/telegram-bridge/")
+    print("  2. Run: /afk (to activate the bridge)")
+    print("  3. Approve requests on Telegram!")
+    print()
 
 
-def _fetch_chat_id(token):
-    """Try to fetch chat_id from Telegram getUpdates API."""
+def _fetch_available_chats(token):
+    """Fetch all chats that have sent messages to this bot."""
+    chats = {}
     try:
         url = f"https://api.telegram.org/bot{token}/getUpdates"
         with urllib.request.urlopen(url, timeout=5) as response:
             data = json.loads(response.read().decode())
             if data.get("ok") and data.get("result"):
-                # Get chat_id from the first message
+                # Collect all unique chats from messages
                 for update in data.get("result", []):
                     msg = update.get("message", {})
                     if msg.get("chat"):
-                        return msg["chat"].get("id")
-    except (urllib.error.URLError, json.JSONDecodeError, Exception):
+                        chat = msg["chat"]
+                        chat_id = str(chat.get("id"))
+                        chat_title = chat.get("title") or chat.get("first_name", "Unknown")
+                        chat_type = chat.get("type", "private")
+                        if chat_id not in chats:
+                            chats[chat_id] = {
+                                "title": chat_title,
+                                "type": chat_type,
+                            }
+    except (urllib.error.URLError, json.JSONDecodeError, Exception) as e:
         pass
-    return None
+    return chats
 
 
 # ─── Status ──────────────────────────────────────────────────────────────────
