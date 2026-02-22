@@ -159,3 +159,7 @@ S2: push to remote
 ## Credits
 
 Built by [Greg Motyl](https://github.com/gmotyl)
+
+## Support
+
+If you find this useful, you can [buy me a coffee](https://buymeacoffee.com/motyl.dev)!
