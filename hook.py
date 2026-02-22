@@ -18,6 +18,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 
 logging.basicConfig(
@@ -114,9 +116,6 @@ def stop_daemon(state):
 # ─── Setup ───────────────────────────────────────────────────────────────────
 
 def cmd_setup():
-    import urllib.request
-    import urllib.error
-
     config = load_config()
 
     print("╔══════════════════════════════════════════════╗")
