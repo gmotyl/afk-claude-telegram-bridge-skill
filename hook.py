@@ -459,6 +459,16 @@ def cmd_deactivate(session_id):
 
 # ─── Response sending (for Claude to send output back to Telegram) ──────────
 
+def get_active_sessions(state):
+    """Get dict of active session_id -> slot_num from state."""
+    sessions = {}
+    for slot_num, info in state.get("slots", {}).items():
+        sid = info.get("session_id")
+        if sid:
+            sessions[sid] = slot_num
+    return sessions
+
+
 def send_response_to_telegram(text):
     """Send a response message back to Telegram for active AFK session."""
     try:
