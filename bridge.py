@@ -347,6 +347,15 @@ class BridgeDaemon:
             text = format_notification_message(event, slot)
             self.tg.send_message(text, thread_id=thread_id)
 
+        elif etype == "response":
+            # Forward Claude's response back to Telegram
+            response_text = event.get("text", "").strip()
+            if response_text:
+                # Truncate if too long
+                if len(response_text) > 3000:
+                    response_text = response_text[:2900] + "\n...(truncated)"
+                self.tg.send_message(f"🤖 {response_text}", thread_id=thread_id)
+
     def _handle_update(self, update):
         if "callback_query" in update:
             self._handle_callback(update["callback_query"])

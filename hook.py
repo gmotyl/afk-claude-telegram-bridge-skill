@@ -300,7 +300,7 @@ def cmd_status():
 
 # ─── Activate ────────────────────────────────────────────────────────────────
 
-def cmd_activate(session_id, project):
+def cmd_activate(session_id, project, topic_name=""):
     config = load_config()
 
     # Check bot is configured
@@ -346,17 +346,23 @@ def cmd_activate(session_id, project):
         slots[assigned_slot] = {
             "session_id": session_id,
             "project": project or "unknown",
+            "topic_name": topic_name or f"S{assigned_slot} - {project or 'unknown'}",
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
         # Create IPC directory
         ipc_session_dir = os.path.join(IPC_DIR, session_id)
         os.makedirs(ipc_session_dir, exist_ok=True)
+
+        # Calculate topic name: use custom if provided, else default to "S{slot} - {project}"
+        calculated_topic_name = topic_name or f"S{assigned_slot} - {project or 'unknown'}"
+
         with open(os.path.join(ipc_session_dir, "meta.json"), "w") as f:
             json.dump({
                 "session_id": session_id,
                 "slot": assigned_slot,
                 "project": project or "unknown",
+                "topic_name": calculated_topic_name,
                 "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }, f, indent=2)
 
@@ -373,6 +379,7 @@ def cmd_activate(session_id, project):
             "type": "activation",
             "slot": assigned_slot,
             "project": project or "unknown",
+            "topic_name": calculated_topic_name,
             "session_id": session_id,
             "timestamp": time.time(),
         }
@@ -392,7 +399,7 @@ def cmd_deactivate(session_id):
     def do_deactivate(state):
         slots = state.setdefault("slots", {})
 
-        # Find and remove this session's slot (handle both temp and real session_ids)
+        # Find this session's slot (handle both temp and real session_ids)
         removed_slot = None
         actual_session_id = session_id  # May be remapped to real id
 
@@ -400,7 +407,6 @@ def cmd_deactivate(session_id):
             if info.get("session_id") == session_id:
                 removed_slot = slot_num
                 actual_session_id = session_id
-                del slots[slot_num]
                 break
 
         if removed_slot is None:
@@ -411,14 +417,14 @@ def cmd_deactivate(session_id):
                 for slot_num, info in list(slots.items()):
                     removed_slot = slot_num
                     actual_session_id = info.get("session_id", session_id)
-                    del slots[slot_num]
                     break
 
         if removed_slot is None:
             print("No active AFK sessions found.")
             return
 
-        # Write deactivation event before removing IPC dir
+        # Write deactivation event BEFORE removing from state.json
+        # This ensures daemon sees the session as active and scans the event
         ipc_session_dir = os.path.join(IPC_DIR, actual_session_id)
         if os.path.isdir(ipc_session_dir):
             event_file = os.path.join(ipc_session_dir, "events.jsonl")
@@ -431,9 +437,14 @@ def cmd_deactivate(session_id):
             }
             with open(event_file, "a") as f:
                 f.write(json.dumps(event) + "\n")
-            # Give daemon a moment to pick up the event
-            time.sleep(0.5)
-            # Clean up IPC dir
+            # Give daemon time to scan and process the deactivation event
+            time.sleep(1.5)
+
+        # NOW remove the slot from state.json (after daemon has processed the event)
+        del slots[removed_slot]
+
+        # Clean up IPC dir
+        if os.path.isdir(ipc_session_dir):
             import shutil
             shutil.rmtree(ipc_session_dir, ignore_errors=True)
 
@@ -444,6 +455,38 @@ def cmd_deactivate(session_id):
         print(f"AFK mode deactivated — slot S{removed_slot} released.")
 
     locked_state_op(do_deactivate)
+
+
+# ─── Response sending (for Claude to send output back to Telegram) ──────────
+
+def send_response_to_telegram(text):
+    """Send a response message back to Telegram for active AFK session."""
+    try:
+        state = load_state()
+        active = get_active_sessions(state)
+        if not active:
+            return False
+
+        # Send to first active session
+        session_id = list(active.keys())[0]
+        ipc_session_dir = os.path.join(IPC_DIR, session_id)
+        event_file = os.path.join(ipc_session_dir, "events.jsonl")
+
+        if not os.path.isdir(ipc_session_dir):
+            return False
+
+        event = {
+            "id": str(uuid.uuid4())[:8],
+            "type": "response",
+            "text": text,
+            "session_id": session_id,
+            "timestamp": time.time(),
+        }
+        with open(event_file, "a") as f:
+            f.write(json.dumps(event) + "\n")
+        return True
+    except Exception:
+        return False
 
 
 # ─── Hook Mode ───────────────────────────────────────────────────────────────
@@ -677,14 +720,15 @@ def _poll_response(ipc_dir, event_id, timeout):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: hook.py <activate|deactivate|status|setup|hook>", file=sys.stderr)
+        print("Usage: hook.py <activate|deactivate|status|setup|respond|hook>", file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
     if cmd == "activate":
         session_id = sys.argv[2] if len(sys.argv) > 2 else ""
         project = sys.argv[3] if len(sys.argv) > 3 else ""
-        cmd_activate(session_id, project)
+        topic_name = sys.argv[4] if len(sys.argv) > 4 else ""
+        cmd_activate(session_id, project, topic_name)
     elif cmd == "deactivate":
         session_id = sys.argv[2] if len(sys.argv) > 2 else ""
         cmd_deactivate(session_id)
@@ -692,6 +736,12 @@ if __name__ == "__main__":
         cmd_status()
     elif cmd == "setup":
         cmd_setup()
+    elif cmd == "respond":
+        text = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
+        if send_response_to_telegram(text):
+            print("✓ Response sent to Telegram")
+        else:
+            print("✗ No active AFK session", file=sys.stderr)
     elif cmd == "hook":
         cmd_hook()
     else:
