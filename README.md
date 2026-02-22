@@ -4,10 +4,11 @@ Remote-control Claude Code from your phone via Telegram when you're away from yo
 
 ## Use Case
 
-You're working on code with Claude Code, but you need to leave your desk or close your laptop. With this bridge, you can:
+You're working on code with Claude Code, but you need to leave your desk. With this bridge, you can:
 
 - **Approve tool calls** from your phone (Write, Bash, Edit, etc.)
-- **Continue working** by sending new instructions when Claude finishes a task
+- **Send instructions** and see Claude's responses directly in Telegram
+- **Continue conversations** — multiple back-and-forth exchanges without touching your laptop
 - **Monitor progress** via Telegram notifications
 - **Run multiple sessions** concurrently with automatic topic routing
 
@@ -15,179 +16,253 @@ Perfect for: working on the go, meetings, or just stepping away while keeping Cl
 
 ## Features
 
-- 🔐 Permission approval via Telegram inline keyboards
-- 📂 **Telegram Topics** — Each session gets its own topic/thread in a Telegram group
-- 🚫 **No prefixes needed** — Just type in the topic, bot knows which session to send to
-- 📥 **Message Buffer** — Queue instructions while Claude is working, delivered when task completes
-- 🤖 Auto-approve read-only tools (Read, Glob, Grep, WebSearch, WebFetch)
-- 👥 Multi-session support (up to 4 concurrent sessions)
-- 📦 Zero Python dependencies (stdlib only)
+- **Session Isolation** — Only the terminal that called `/afk` publishes to Telegram. Other concurrent Claude sessions are completely isolated.
+- **Telegram Topics** — Each session gets its own topic/thread in a Telegram group
+- **Response Forwarding** — Claude's responses appear in Telegram as chat messages
+- **Conversation Chain** — Send instructions, see responses, send more — stays alive until you stop
+- **Message Buffer** — Queue instructions while Claude is working, auto-delivered when idle
+- **Smart Routing** — Just type in the topic, no prefixes needed
+- **Auto-approve** read-only tools (Read, Glob, Grep, WebSearch, WebFetch)
+- **Multi-session** support (up to 4 concurrent sessions)
+- **Zero dependencies** — Python stdlib only
 
-## ⚠️ Requirements
+## Requirements
 
-- **Telegram Group** (not private chat) with Topics enabled
+- Python 3
+- bash
+- Telegram Group (not private chat) with **Topics enabled**
 - Bot added to the group as **Administrator**
-- Group chat ID (starts with `-100...`)
 
-## Quick Start (One-Liner)
+## Installation
 
-```bash
-git clone https://github.com/gmotyl/afk-claude-telegram-bridge.git && cd afk-claude-telegram-bridge && ./setup.sh
-```
+### 1. Create Telegram Bot
 
-Or if you prefer manual installation:
+1. Open Telegram, search **@BotFather**, send `/newbot`
+2. Name it "Claude Bridge" (or your preference)
+3. Copy the bot token
 
-### 1. Clone or Copy
-
-```bash
-git clone https://github.com/gmotyl/afk-claude-telegram-bridge.git
-cp -r afk-claude-telegram-bridge/* ~/.claude/hooks/telegram-bridge/
-```
-
-### 2. Create Telegram Bot
-
-1. Open Telegram → search **@BotFather**
-2. Send `/newbot`
-3. Name it "Claude Bridge" (or your preference)
-4. Copy the bot token
-
-### 3. Create a Telegram Group
+### 2. Create a Telegram Group
 
 1. Create a new group in Telegram
 2. Add your bot to the group
 3. **Make bot an Administrator**
 4. **Enable Topics** in group settings
-5. Send a message to the group
+5. Send a message in the group (so the bot can detect it)
 
-### 4. Get Your Group Chat ID
+### 3. Install
 
-1. Visit: `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
-2. Find `"chat":{"id":-100...}` — that's your group chat_id (starts with -100)
-3. Copy the full ID (including the -100 prefix)
+```bash
+git clone https://github.com/gmotyl/afk-claude-telegram-bridge.git ~/.claude/hooks/telegram-bridge
+```
 
-### 5. Configure
+### 4. Run Setup
 
 ```bash
 ~/.claude/hooks/telegram-bridge/hook.sh --setup
 ```
 
-Enter your bot token and the group chat ID (starts with -100).
+This will:
+1. Ask for your bot token
+2. Auto-detect your admin groups from Telegram API
+3. Auto-select if only one group (or let you choose)
+4. Save config to `~/.claude/hooks/telegram-bridge/config.json`
 
-### 6. Add Hooks
+### 5. Add Hooks to Claude Code
 
-Edit `~/.claude/settings.json`:
+Edit `~/.claude/settings.json` and add the hooks:
 
 ```json
 {
   "hooks": {
-    "Stop": {
-      "hook": "~/.claude/hooks/telegram-bridge/hook.sh",
-      "timeout": 660
-    },
-    "Notification": {
-      "hook": "~/.claude/hooks/telegram-bridge/hook.sh",
-      "timeout": 10
-    },
-    "PermissionRequest": {
-      "hook": "~/.claude/hooks/telegram-bridge/hook.sh",
-      "timeout": 360
-    }
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/telegram-bridge/hook.sh",
+            "timeout": 660
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/telegram-bridge/hook.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/telegram-bridge/hook.sh",
+            "timeout": 360
+          }
+        ]
+      }
+    ]
   }
 }
 ```
 
-### 7. Create Commands
+### 6. Add Slash Commands
 
-`~/.claude/commands/afk.md`:
+Create `~/.claude/commands/afk.md`:
+
 ```markdown
-# AFK Mode
+---
+allowed-tools: Bash
+---
 
-Enable AFK mode to forward Claude Code events to Telegram.
+# AFK Mode — Activate Telegram Bridge
 
-/afk
+Enable remote control of this Claude Code session via Telegram.
+
+## Steps
+
+1. Generate a session ID:
+   ```bash
+   SESSION_ID=$(python3 -c "import uuid; print(str(uuid.uuid4())[:12])")
+   echo "Session: $SESSION_ID"
+   ```
+
+2. Get the topic name (use first argument if provided, otherwise default):
+   ```bash
+   TOPIC_NAME="${1:=$(basename "$PWD")}"
+   ```
+
+3. Activate AFK mode:
+   ```bash
+   ~/.claude/hooks/telegram-bridge/hook.sh --activate "$SESSION_ID" "$(basename "$PWD")" "$TOPIC_NAME"
+   ```
+
+4. Confirm to user: "AFK mode active! Topic: TOPIC_NAME. Use /back to deactivate."
 ```
 
-`~/.claude/commands/back.md`:
+Create `~/.claude/commands/back.md`:
+
 ```markdown
-# Back from AFK
+---
+allowed-tools: Bash
+---
 
-Disable AFK mode and return to local control.
+# Back — Deactivate Telegram Bridge
 
-/back
+## Steps
+
+1. Deactivate the active AFK session:
+   ```bash
+   python3 ~/.claude/hooks/telegram-bridge/hook.py deactivate "current"
+   ```
+
+2. Confirm to user: "AFK mode deactivated. Back to local control."
 ```
-
-## How It Works
-
-### Auto-Topics
-When you activate `/afk`, the bot automatically creates a new Topic in your Telegram group (e.g., "S1 - myproject"). All communication for that session happens in that topic.
-
-### Smart Routing
-No need to type "S1: do this". Just open the topic and type your instruction — the bot knows which session it belongs to.
-
-### Message Buffer
-If Claude is still working on a task and you send multiple instructions, the bot queues them and delivers all at once when Claude finishes the current task.
 
 ## Usage
 
 ### Activate
+
 ```
-/afk
+/afk              # Topic: current directory name
+/afk my-project   # Topic: "my-project"
 ```
-Bot creates a new topic: "S1 - projectname"
+
+A new Telegram topic is created (e.g., "S1 - my-project").
 
 ### While Away
 
-When Claude needs approval (in the topic):
+**Permission requests** appear with inline buttons:
 ```
 🔐 Permission Request
 Tool: Bash
 `npm install express`
-[✅ Approve] [❌ Deny]
+[Approve] [Deny]
 ```
 
-When task completes (in the topic):
+**Task completion** shows Claude's response and waits for instructions:
 ```
-✅ Task Complete
-I've implemented the login form...
-[🛑 Let it stop]
+🤖 I've implemented the login form with validation...
+
+Reply to give next instruction...
+[Let it stop]
 ```
 
-**Just reply with instructions** — no prefix needed!
+**Just reply with your next instruction** — Claude processes it and sends the response back to Telegram. The conversation continues until you press "Let it stop" or the timeout expires.
+
+### Message Buffer
+
+If you send instructions while Claude is still working, they're queued and automatically delivered when the current task completes.
 
 ### Multiple Sessions
-Each session automatically gets its own topic:
-- Session 1 → Topic "S1 - projectname"
-- Session 2 → Topic "S2 - anotherproject"
+
+Open multiple terminals, each with its own `/afk`:
+- Terminal 1: `/afk frontend` → Topic "S1 - frontend"
+- Terminal 2: `/afk backend` → Topic "S2 - backend"
+
+Each session is fully isolated — messages in one topic only affect that terminal.
 
 ### Deactivate
+
 ```
 /back
 ```
 
-## Commands
+Topic is automatically cleaned up from the Telegram group.
 
-| Command | Description |
-|---------|-------------|
-| `hook.sh --activate <session> [project]` | Enable AFK mode |
-| `hook.sh --deactivate <session>` | Disable AFK mode |
-| `hook.sh --status` | Show active sessions |
-| `hook.sh --setup` | Configure bot |
-| `hook.sh --help` | Help |
+## Architecture
+
+```
+Claude Code ←→ hook.sh/hook.py ←→ IPC (filesystem) ←→ bridge.py daemon ←→ Telegram API
+```
+
+- **hook.py**: Processes Claude Code hook events, manages session binding
+- **bridge.py**: Long-polling Telegram daemon, routes messages between sessions
+- **IPC**: File-based communication via `~/.claude/hooks/telegram-bridge/ipc/{session_id}/`
+- **Session binding**: First hook event from a Claude session binds it to its AFK slot
+
+## Auto-Approved Tools
+
+These tools are approved automatically without Telegram notification:
+
+Read, Glob, Grep, WebSearch, WebFetch, TaskList, TaskGet, TaskCreate, TaskUpdate
+
+Configure in `config.json`:
+```json
+{
+  "auto_approve_tools": ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
+}
+```
 
 ## Troubleshooting
 
-- **Logs**: `cat ~/.claude/hooks/telegram-bridge/daemon.log`
-- **Status**: `~/.claude/hooks/telegram-bridge/hook.sh --status`
-- **Manual start**: `python3 ~/.claude/hooks/telegram-bridge/bridge.py`
-- **Kill daemon**: `kill $(jq -r '.daemon_pid' ~/.claude/hooks/telegram-bridge/state.json)`
+| Issue | Solution |
+|-------|----------|
+| No messages in Telegram | Check `daemon.log`: `cat ~/.claude/hooks/telegram-bridge/daemon.log` |
+| Hook not firing | Check `hook-debug.log`: `cat ~/.claude/hooks/telegram-bridge/hook-debug.log` |
+| Topic not created | Ensure bot is admin with Topics permission |
+| Permission timeout | Increase timeout in `settings.json` (default: 360s) |
+| Daemon crashed | Restart: `python3 ~/.claude/hooks/telegram-bridge/bridge.py` |
+| Check status | `~/.claude/hooks/telegram-bridge/hook.sh --status` |
+| Kill daemon | `kill $(jq -r '.daemon_pid' ~/.claude/hooks/telegram-bridge/state.json)` |
 
-## Requirements
+## CLI Commands
 
-- Python 3 (stdlib only)
-- bash
-- Telegram bot token
-- Telegram group with Topics enabled
-- Bot must be group administrator
+| Command | Description |
+|---------|-------------|
+| `hook.sh --activate <session> [project] [topic]` | Enable AFK mode |
+| `hook.sh --deactivate <session>` | Disable AFK mode |
+| `hook.sh --status` | Show active sessions |
+| `hook.sh --setup` | Configure bot token and group |
+| `hook.sh --help` | Show help |
 
 ## Credits
 
