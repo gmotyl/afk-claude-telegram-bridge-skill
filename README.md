@@ -29,7 +29,7 @@ Perfect for: working on the go, meetings, or just stepping away while keeping Cl
 ## Quick Install
 
 ```bash
-npx skills add gmotyl/afk-claude-telegram-bridge-skill --skill afk-claude-telegram-bridge
+npx skills add gmotyl/afk-claude-telegram-bridge-skill --skill afk-claude-telegram-bridge -y && bash ~/.claude/skills/afk-claude-telegram-bridge/install.sh
 ```
 
 Or with curl:
@@ -38,7 +38,9 @@ Or with curl:
 curl -fsSL https://raw.githubusercontent.com/gmotyl/afk-claude-telegram-bridge-skill/main/install.sh | bash
 ```
 
-Both methods will install hooks, register them in Claude Code, and guide you through Telegram bot setup.
+Both methods copy files, register hooks, install `/afk` and `/back` commands, and walk you through Telegram bot setup.
+
+**Restart Claude Code after installation** to load the new commands.
 
 ## Requirements
 

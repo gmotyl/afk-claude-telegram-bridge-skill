@@ -54,6 +54,20 @@ chmod +x "$INSTALL_DIR/hook.sh"
 
 echo "Core files installed to $INSTALL_DIR"
 
+# --- Install /afk and /back commands ---
+COMMANDS_DIR="$GLOBAL_BASE/commands"
+mkdir -p "$COMMANDS_DIR"
+
+if [ -n "$SCRIPT_DIR" ]; then
+  cp "$SCRIPT_DIR/skills/afk/SKILL.md" "$COMMANDS_DIR/afk.md"
+  cp "$SCRIPT_DIR/skills/back/SKILL.md" "$COMMANDS_DIR/back.md"
+else
+  curl -fsSL "$REPO_BASE/skills/afk/SKILL.md" -o "$COMMANDS_DIR/afk.md"
+  curl -fsSL "$REPO_BASE/skills/back/SKILL.md" -o "$COMMANDS_DIR/back.md"
+fi
+
+echo "Commands installed: /afk, /back"
+
 # --- Update settings.json with hooks ---
 echo ""
 echo "Registering hooks in settings.json..."
@@ -130,15 +144,24 @@ fi
 
 # --- Done ---
 echo ""
-echo "=== Installation complete ==="
-echo ""
-echo "Usage:"
-echo "  /afk              Activate AFK mode (forward to Telegram)"
-echo "  /afk my-project   Activate with custom topic name"
-echo "  /back             Deactivate AFK mode"
+echo "============================================"
+echo "  ✅ Installation complete!"
+echo "============================================"
 echo ""
 echo "Files installed:"
 echo "  $INSTALL_DIR/hook.py"
 echo "  $INSTALL_DIR/hook.sh"
 echo "  $INSTALL_DIR/bridge.py"
+echo "  $COMMANDS_DIR/afk.md"
+echo "  $COMMANDS_DIR/back.md"
+echo ""
+echo "Hooks registered in:"
+echo "  $SETTINGS"
+echo ""
+echo "⚠️  Restart Claude Code to load the new /afk and /back commands."
+echo ""
+echo "Usage (after restart):"
+echo "  /afk              Activate AFK mode (forward to Telegram)"
+echo "  /afk my-project   Activate with custom topic name"
+echo "  /back             Deactivate AFK mode"
 echo ""

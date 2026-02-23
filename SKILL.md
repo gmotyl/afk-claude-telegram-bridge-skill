@@ -26,84 +26,30 @@ Installs a complete Telegram ↔ Claude Code bridge that allows you to:
 
 ## Installation
 
-### 1. Copy Bridge Files
+Run the installer — it copies files, registers hooks, installs `/afk` and `/back` commands, and walks you through Telegram bot setup:
 
 ```bash
-# Create the bridge directory
-mkdir -p ~/.claude/hooks/telegram-bridge
-
-# Copy the skill files
-cp -r <skill-dir>/* ~/.claude/hooks/telegram-bridge/
+bash ~/.claude/skills/afk-claude-telegram-bridge/install.sh
 ```
 
-### 2. Configure Telegram Bot
+The installer handles everything:
+- Copies hook.py, hook.sh, bridge.py to `~/.claude/hooks/telegram-bridge/`
+- Installs `/afk` and `/back` commands to `~/.claude/commands/`
+- Registers Stop, Notification, and PermissionRequest hooks in `~/.claude/settings.json`
+- Prompts for your bot token and auto-detects your Telegram group
+
+**Restart Claude Code after installation** to load the new `/afk` and `/back` commands.
+
+### Prerequisites
+
+Before running the installer, create a Telegram bot:
 
 1. Open Telegram → search **@BotFather** → send `/newbot`
 2. Name it "Claude Bridge" (or your preferred name)
 3. Copy the bot token
-
-### 3. Get Your Chat ID
-
-1. Send any message to your new bot
-2. Visit: `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
-3. Find `"chat":{"id":123456789}` in the response
-
-### 4. Run Setup
-
-```bash
-~/.claude/hooks/telegram-bridge/hook.sh --setup
-```
-
-Enter your bot token and chat ID when prompted.
-
-### 5. Add Hooks to settings.json
-
-Add telegram-bridge to your `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "Stop": {
-      "hook": "~/.claude/hooks/telegram-bridge/hook.sh",
-      "timeout": 660
-    },
-    "Notification": {
-      "hook": "~/.claude/hooks/telegram-bridge/hook.sh",
-      "timeout": 10
-    },
-    "PermissionRequest": {
-      "hook": "~/.claude/hooks/telegram-bridge/hook.sh",
-      "timeout": 360
-    }
-  }
-}
-```
-
-### 6. Create Slash Commands
-
-Create `~/.claude/commands/afk.md`:
-
-```markdown
-# AFK Mode
-
-Enable AFK mode to forward Claude Code events to Telegram.
-
-## Usage
-
-/afk
-```
-
-Create `~/.claude/commands/back.md`:
-
-```markdown
-# Back from AFK
-
-Disable AFK mode and return to local control.
-
-## Usage
-
-/back
-```
+4. Create a **Telegram Group** with **Topics enabled**
+5. Add the bot to the group as **Administrator**
+6. Send a message in the group (so the bot can detect it)
 
 ## Usage
 
