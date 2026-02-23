@@ -61,6 +61,16 @@ class TelegramAPI:
             log.warning("Unexpected error on %s: %s", method, e)
             return None
 
+    def set_my_commands(self):
+        """Register bot commands for Telegram command menu."""
+        data = {
+            "commands": [
+                {"command": "compact", "description": "Compress conversation context"},
+                {"command": "clear", "description": "Clear conversation history"},
+            ]
+        }
+        return self._request("setMyCommands", data)
+
     def create_forum_topic(self, name):
         """Tworzy nowy wątek (Topic) w Grupie Telegrama"""
         data = {
@@ -87,7 +97,15 @@ class TelegramAPI:
             data["message_thread_id"] = thread_id
         if reply_markup:
             data["reply_markup"] = reply_markup
-        return self._request("sendMessage", data)
+        result = self._request("sendMessage", data)
+
+        # Detect deleted topic
+        if result and not result.get("ok"):
+            error_desc = result.get("description", "").lower()
+            if "thread not found" in error_desc or "message thread not found" in error_desc:
+                return {"ok": False, "topic_deleted": True, "description": error_desc}
+
+        return result
 
     def edit_message(self, message_id, text, reply_markup=None, parse_mode="HTML"):
         data = {
@@ -213,6 +231,11 @@ class BridgeDaemon:
         self.pending_events = {}
         # Pamięć: session_id -> message_thread_id (Topic ID)
         self.session_threads = {}
+        # Idle ping tracking: session_id -> last_ping_timestamp
+        self.last_idle_ping = {}
+        # Context management: session_id -> interaction count
+        self.interaction_counts = {}
+        self.context_warning_sent = {}  # session_id -> threshold at which warning was sent
 
         signal.signal(signal.SIGTERM, self._handle_sigterm)
         signal.signal(signal.SIGINT, self._handle_sigterm)
@@ -223,6 +246,7 @@ class BridgeDaemon:
 
     def run(self):
         log.info("Bridge daemon starting")
+        self.tg.set_my_commands()
         self.tg.get_updates(timeout=0)
 
         last_heartbeat, last_event_scan = 0, 0
@@ -311,6 +335,7 @@ class BridgeDaemon:
                 log.error(f"[ACTIVATION] Failed to create topic: {res}")
 
             self.tg.send_message(f"📡 <b>AFK Activated</b>\nProject: {escape_html(project)}", thread_id=thread_id)
+            self.last_idle_ping[session_id] = time.time()
 
         elif etype == "deactivation":
             log.info(f"[DEACTIVATION] Processing for session {session_id[:8]}...")
@@ -334,9 +359,10 @@ class BridgeDaemon:
                 pass
 
         elif etype == "permission_request":
+            self._increment_interaction(session_id)
             text = format_permission_message(event, slot)
             kb = permission_keyboard(event_id)
-            result = self.tg.send_message(text, thread_id=thread_id, reply_markup=kb)
+            result = self._send_to_session(text, session_id, reply_markup=kb)
             if result and result.get("ok"):
                 self.pending_events[event_id] = {
                     "session_id": session_id,
@@ -349,6 +375,7 @@ class BridgeDaemon:
                 log.error(f"[PERMISSION] Failed to send: {result}")
 
         elif etype == "stop":
+            self._increment_interaction(session_id)
             is_response = event.get("stop_hook_active", False)
 
             # If this is a response to a Telegram instruction, forward the response first
@@ -356,7 +383,7 @@ class BridgeDaemon:
                 last_msg = event.get("last_message", "").strip()
                 if last_msg:
                     text = f"🤖 {escape_html(last_msg)}"
-                    self.tg.send_message(text, thread_id=thread_id)
+                    self._send_to_session(text, session_id)
                     log.info(f"[STOP] Forwarded response to Telegram (stop_hook_active)")
                 # Fall through to normal stop handling — create pending event
                 # so the next Telegram message gets routed as the next instruction
@@ -384,7 +411,7 @@ class BridgeDaemon:
             else:
                 text = format_stop_message(event, slot)
             kb = stop_keyboard(event_id)
-            result = self.tg.send_message(text, thread_id=thread_id, reply_markup=kb)
+            result = self._send_to_session(text, session_id, reply_markup=kb)
             if result and result.get("ok"):
                 self.pending_events[event_id] = {
                     "session_id": session_id,
@@ -398,14 +425,33 @@ class BridgeDaemon:
 
         elif etype == "notification":
             text = format_notification_message(event, slot)
-            self.tg.send_message(text, thread_id=thread_id)
+            self._send_to_session(text, session_id)
 
         elif etype == "response":
             response_text = event.get("text", "").strip()
             if response_text:
                 if len(response_text) > 3000:
                     response_text = response_text[:2900] + "\n...(truncated)"
-                self.tg.send_message(f"🤖 {response_text}", thread_id=thread_id)
+                self._send_to_session(f"🤖 {response_text}", session_id)
+
+        elif etype == "keep_alive":
+            # Hook is still alive, check if we should send idle ping
+            idle_ping_hours = self.config.get("idle_ping_hours", 12)
+            idle_ping_seconds = idle_ping_hours * 3600
+            last_ping = self.last_idle_ping.get(session_id, 0)
+            now = time.time()
+
+            if now - last_ping > idle_ping_seconds:
+                hours_idle = int((now - last_ping) / 3600) if last_ping else 0
+                if hours_idle > 0:
+                    self._send_to_session(
+                        f"💤 Session idle for {hours_idle}h. Still listening.",
+                        session_id,
+                    )
+                self.last_idle_ping[session_id] = now
+                log.info(f"[KEEPALIVE] Idle ping sent for session {session_id[:8]}")
+            else:
+                log.debug(f"[KEEPALIVE] Session {session_id[:8]} alive, next ping in {int(idle_ping_seconds - (now - last_ping))}s")
 
     def _handle_update(self, update):
         if "callback_query" in update:
@@ -422,15 +468,20 @@ class BridgeDaemon:
             return
 
         action, event_id = data.split(":", 1)
-        pending = self.pending_events.get(event_id)
 
-        if not pending:
-            self.tg.answer_callback(cq_id, "Event expired")
-            return
+        # Context management callbacks don't use pending_events
+        if action in ("compact", "clear", "dismiss_ctx"):
+            pass  # handled below, skip pending lookup
+        else:
+            pending = self.pending_events.get(event_id)
 
-        session_id = pending["session_id"]
-        msg_id = pending["message_id"]
-        ipc_session_dir = IPC_DIR / session_id
+            if not pending:
+                self.tg.answer_callback(cq_id, "Event expired")
+                return
+
+            session_id = pending["session_id"]
+            msg_id = pending["message_id"]
+            ipc_session_dir = IPC_DIR / session_id
 
         if action == "allow":
             self._write_response(ipc_session_dir, event_id, {"decision": "allow"})
@@ -450,6 +501,77 @@ class BridgeDaemon:
             self.tg.edit_message(msg_id, f"🛑 Stopped")
             del self.pending_events[event_id]
 
+        elif action == "compact":
+            # session_id is in event_id position for context commands
+            target_sid = event_id  # callback_data is "compact:{session_id}"
+            ipc_dir = IPC_DIR / target_sid
+
+            # Find pending stop event for this session to route command
+            stop_event_id = None
+            for eid, info in self.pending_events.items():
+                if info["session_id"] == target_sid and info["type"] == "stop":
+                    stop_event_id = eid
+                    break
+
+            compact_instruction = (
+                "Summarize and compress this conversation to preserve key context while reducing token usage. "
+                "Keep: current task state, key decisions, file paths, active errors. "
+                "Drop: completed tool outputs, verbose logs, resolved discussions."
+            )
+            if stop_event_id:
+                self._write_response(ipc_dir, stop_event_id, {"instruction": compact_instruction})
+                msg_id = self.pending_events[stop_event_id]["message_id"]
+                self.tg.edit_message(msg_id, f"▶️ Running /compact")
+                del self.pending_events[stop_event_id]
+            else:
+                # Queue it
+                queued_path = ipc_dir / "queued_instruction.json"
+                try:
+                    with open(queued_path, "w") as f:
+                        json.dump({"instruction": compact_instruction, "timestamp": time.time()}, f)
+                except OSError:
+                    pass
+
+            self.tg.answer_callback(cq_id, "Compacting context...")
+            thread_id = self.session_threads.get(target_sid)
+            if thread_id:
+                self.tg.send_message("📦 Compacting context...", thread_id=thread_id)
+
+        elif action == "clear":
+            target_sid = event_id
+            ipc_dir = IPC_DIR / target_sid
+
+            stop_event_id = None
+            for eid, info in self.pending_events.items():
+                if info["session_id"] == target_sid and info["type"] == "stop":
+                    stop_event_id = eid
+                    break
+
+            if stop_event_id:
+                self._write_response(ipc_dir, stop_event_id, {"instruction": "/clear"})
+                msg_id = self.pending_events[stop_event_id]["message_id"]
+                self.tg.edit_message(msg_id, f"▶️ Running /clear")
+                del self.pending_events[stop_event_id]
+            else:
+                queued_path = ipc_dir / "queued_instruction.json"
+                try:
+                    with open(queued_path, "w") as f:
+                        json.dump({"instruction": "/clear", "timestamp": time.time()}, f)
+                except OSError:
+                    pass
+
+            self.tg.answer_callback(cq_id, "Clearing context...")
+            thread_id = self.session_threads.get(target_sid)
+            if thread_id:
+                self.tg.send_message("🗑 Clearing context...", thread_id=thread_id)
+
+            # Reset interaction counter
+            self.interaction_counts[target_sid] = 0
+            self.context_warning_sent[target_sid] = 0
+
+        elif action == "dismiss_ctx":
+            self.tg.answer_callback(cq_id, "Dismissed")
+
     def _handle_message(self, msg):
         text = msg.get("text", "").strip()
         chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -458,6 +580,72 @@ class BridgeDaemon:
         msg_thread_id = msg.get("message_thread_id")
 
         if chat_id != self.tg.chat_id or not text:
+            return
+
+        # Strip @botname suffix from commands (Telegram adds it in groups)
+        # e.g. "/clear@Clade_motyl_ai_bot" -> "/clear"
+        if text.startswith("/") and "@" in text.split()[0]:
+            text = text.split("@")[0]
+
+        # Intercept context management commands
+        COMPACT_INSTRUCTION = (
+            "Summarize and compress this conversation to preserve key context while reducing token usage. "
+            "Keep: current task state, key decisions, file paths, active errors. "
+            "Drop: completed tool outputs, verbose logs, resolved discussions."
+        )
+        COMMAND_MAP = {
+            "/clear": "/clear",
+            "/compact": COMPACT_INSTRUCTION,
+        }
+        if text.lower() in COMMAND_MAP:
+            command = text.lower().lstrip("/")
+            instruction = COMMAND_MAP[text.lower()]
+            # Find which session this topic belongs to
+            target_session = None
+            for sid, t_id in self.session_threads.items():
+                if t_id == msg_thread_id:
+                    target_session = sid
+                    break
+
+            if not target_session:
+                state = load_state()
+                active = get_active_sessions(state)
+                if len(active) == 1:
+                    target_session = list(active.keys())[0]
+
+            if target_session:
+                ipc_dir = IPC_DIR / target_session
+
+                # Find pending stop event to route command immediately
+                stop_event_id = None
+                for eid, info in self.pending_events.items():
+                    if info["session_id"] == target_session and info["type"] == "stop":
+                        stop_event_id = eid
+                        break
+
+                if stop_event_id:
+                    self._write_response(ipc_dir, stop_event_id, {"instruction": instruction})
+                    msg_id = self.pending_events[stop_event_id]["message_id"]
+                    self.tg.edit_message(msg_id, f"▶️ Running /{command}")
+                    del self.pending_events[stop_event_id]
+                else:
+                    queued_path = ipc_dir / "queued_instruction.json"
+                    try:
+                        with open(queued_path, "w") as f:
+                            json.dump({"instruction": instruction, "timestamp": time.time()}, f)
+                    except OSError:
+                        pass
+
+                self.tg.send_message(
+                    f"{'📦' if command == 'compact' else '🗑'} Sending /{command} to Claude...",
+                    thread_id=msg_thread_id,
+                )
+                log.info(f"[CONTEXT] Intercepted /{command} for session {target_session[:8]}")
+
+                # Reset counter on clear
+                if command == "clear":
+                    self.interaction_counts[target_session] = 0
+                    self.context_warning_sent[target_session] = 0
             return
 
         # Szukamy sesji, do której przypisany jest ten konkretny Temat
@@ -492,6 +680,7 @@ class BridgeDaemon:
             self.tg.edit_message(msg_id, f"▶️ Continuing: <i>{escape_html(text[:200])}</i>")
             del self.pending_events[stop_event_id]
             self.tg.send_message(f"📨 Wysłano do Agenta", thread_id=msg_thread_id)
+            self._increment_interaction(target_session)
         else:
             # MESSAGE BUFFER: Claude pracuje, więc dołączamy to do kolejki
             queued_path = ipc_session_dir / "queued_instruction.json"
@@ -509,6 +698,7 @@ class BridgeDaemon:
                 with open(queued_path, "w") as f:
                     json.dump({"instruction": final_instruction, "timestamp": time.time()}, f)
                 self.tg.send_message(f"📥 Dodano do kolejki instrukcji.", thread_id=msg_thread_id)
+                self._increment_interaction(target_session)
             except OSError:
                 pass
 
@@ -519,6 +709,97 @@ class BridgeDaemon:
                 json.dump(response, f)
         except OSError as e:
             log.error("Failed to write response %s: %s", response_path, e)
+
+    def _kill_session(self, session_id, reason="topic deleted"):
+        """Write kill file and clean up session state."""
+        ipc_session_dir = IPC_DIR / session_id
+        kill_path = ipc_session_dir / "kill"
+        try:
+            with open(kill_path, "w") as f:
+                f.write(reason)
+            log.info(f"[KILL] Wrote kill file for session {session_id[:8]}: {reason}")
+        except OSError as e:
+            log.error(f"[KILL] Failed to write kill file: {e}")
+
+        # Clean up daemon state
+        if session_id in self.session_threads:
+            del self.session_threads[session_id]
+
+        # Remove slot from state.json
+        try:
+            state = load_state()
+            slots = state.get("slots", {})
+            slot_to_remove = None
+            for slot_num, info in slots.items():
+                if info.get("session_id") == session_id:
+                    slot_to_remove = slot_num
+                    break
+            if slot_to_remove:
+                del slots[slot_to_remove]
+                save_state(state)
+                log.info(f"[KILL] Removed slot S{slot_to_remove} from state")
+        except Exception as e:
+            log.error(f"[KILL] Failed to update state: {e}")
+
+    def _send_to_session(self, text, session_id, reply_markup=None):
+        """Send message to session's thread, handling deleted topics."""
+        thread_id = self.session_threads.get(session_id)
+        result = self.tg.send_message(text, thread_id=thread_id, reply_markup=reply_markup)
+
+        if result and result.get("topic_deleted"):
+            log.warning(f"[ZOMBIE] Topic deleted for session {session_id[:8]}, killing")
+            self._kill_session(session_id, "topic deleted by user")
+            return None
+
+        return result
+
+    def _increment_interaction(self, session_id):
+        """Increment interaction counter and check threshold."""
+        count = self.interaction_counts.get(session_id, 0) + 1
+        self.interaction_counts[session_id] = count
+
+        threshold = self.config.get("context_warning_threshold", 150)
+        last_warned = self.context_warning_sent.get(session_id, 0)
+
+        # Warn at threshold (80%) and again at threshold * 1.25 (100%)
+        if count >= threshold and last_warned < threshold:
+            self._send_context_warning(session_id, count, threshold)
+            self.context_warning_sent[session_id] = threshold
+        elif count >= int(threshold * 1.25) and last_warned < int(threshold * 1.25):
+            self._send_context_warning(session_id, count, int(threshold * 1.25))
+            self.context_warning_sent[session_id] = int(threshold * 1.25)
+
+        # Update meta.json
+        meta_path = IPC_DIR / session_id / "meta.json"
+        try:
+            if meta_path.exists():
+                with open(meta_path) as f:
+                    meta = json.load(f)
+            else:
+                meta = {}
+            meta["interaction_count"] = count
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+        except Exception:
+            pass
+
+        return count
+
+    def _send_context_warning(self, session_id, count, threshold):
+        """Send context warning with action buttons."""
+        thread_id = self.session_threads.get(session_id)
+        text = (
+            f"⚠️ <b>Context Usage Warning</b>\n\n"
+            f"Interactions: {count} (threshold: {threshold})\n"
+            f"Session may degrade. Choose an action:"
+        )
+        kb = {"inline_keyboard": [
+            [{"text": "📦 Compact", "callback_data": f"compact:{session_id}"},
+             {"text": "🗑 Clear", "callback_data": f"clear:{session_id}"}],
+            [{"text": "💨 Dismiss", "callback_data": f"dismiss_ctx:{session_id}"}],
+        ]}
+        self.tg.send_message(text, thread_id=thread_id, reply_markup=kb)
+        log.info(f"[CONTEXT] Warning sent for session {session_id[:8]} at count={count}")
 
 
 if __name__ == "__main__":

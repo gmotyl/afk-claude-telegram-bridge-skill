@@ -14,5 +14,8 @@
     "TaskCreate",
     "TaskUpdate"
   ],
-  "max_slots": 4
+  "max_slots": 4,
+  "keep_alive_poll_seconds": 60,
+  "idle_ping_hours": 12,
+  "context_warning_threshold": 150
 }

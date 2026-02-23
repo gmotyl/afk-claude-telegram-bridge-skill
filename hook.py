@@ -327,6 +327,14 @@ def cmd_activate(session_id, project, topic_name=""):
                 print(f"Session already active in slot S{slot_num}")
                 return slot_num
 
+
+        # Check for duplicate project+topic (different session_id, same intent)
+        for slot_num, info in slots.items():
+            if (info.get("project") == (project or "unknown")
+                    and info.get("topic_name") == (topic_name or f"S{slot_num} - {project or 'unknown'}")):
+                print(f"⚠️  Duplicate detected: project '{project}' already active in slot S{slot_num}")
+                print(f"   Run /back first, then /afk again.")
+                sys.exit(1)
         # Find next available slot
         assigned_slot = None
         for i in range(1, max_slots + 1):
@@ -682,23 +690,43 @@ def cmd_hook():
             f.write(json.dumps(event) + "\n")
         log.info(f"[STOP] Wrote event {event_id} (stop_hook_active={stop_hook_active})")
 
-        # Always poll for next instruction — keeps the Telegram conversation chain alive.
-        # The daemon handles stop_hook_active stops by forwarding the response first,
-        # then creating a pending event for the next instruction.
-        timeout = config.get("stop_timeout", 600)
-        response = _poll_response(ipc_session_dir, event_id, timeout)
+        # Keep-alive loop: poll repeatedly instead of once
+        keep_alive_poll = config.get("keep_alive_poll_seconds", 60)
 
-        if response and response.get("instruction"):
-            # Block the stop and inject instruction
-            result = {
-                "decision": "block",
-                "reason": response["instruction"],
-            }
-            json.dump(result, sys.stdout)
-            sys.exit(0)
-        else:
-            # Timeout or no instruction — let Claude stop
-            sys.exit(0)
+        while True:
+            response = _poll_response_or_kill(ipc_session_dir, event_id, keep_alive_poll)
+
+            # Kill file detected — exit cleanly
+            if response and response.get("_killed"):
+                log.info("[STOP] Killed by daemon (topic deleted)")
+                sys.exit(0)
+
+            # Got instruction from user
+            if response and response.get("instruction"):
+                result = {
+                    "decision": "block",
+                    "reason": response["instruction"],
+                }
+                json.dump(result, sys.stdout)
+                sys.exit(0)
+
+            # Got explicit stop (user tapped "Let it stop")
+            if response and not response.get("instruction") and "instruction" in response:
+                sys.exit(0)
+
+            # Timeout — write keep-alive event and re-poll
+            if response is None:
+                keep_alive_event = {
+                    "id": str(uuid.uuid4())[:8],
+                    "type": "keep_alive",
+                    "session_id": session_id,
+                    "original_event_id": event_id,
+                    "timestamp": time.time(),
+                }
+                with open(event_file, "a") as f:
+                    f.write(json.dumps(keep_alive_event) + "\n")
+                log.debug(f"[STOP] Keep-alive ping, re-polling for event {event_id}")
+                continue
 
     # ── Notification ──
     elif hook_event == "Notification":
@@ -748,6 +776,38 @@ def _format_tool_description(tool_name, tool_input):
             sv = str(v)[:100]
             parts.append(f"  {k}: {sv}")
         return "\n".join(parts)
+
+
+def _check_kill_file(ipc_dir):
+    """Check if daemon wrote a kill marker (topic deleted)."""
+    kill_path = os.path.join(ipc_dir, "kill")
+    return os.path.exists(kill_path)
+
+
+def _poll_response_or_kill(ipc_dir, event_id, timeout):
+    """Poll for response, but exit early if kill file appears."""
+    response_path = os.path.join(ipc_dir, f"response-{event_id}.json")
+    deadline = time.time() + timeout
+    interval = 0.5
+
+    while time.time() < deadline:
+        if _check_kill_file(ipc_dir):
+            log.info("[POLL] Kill file detected, exiting")
+            return {"_killed": True}
+
+        if os.path.exists(response_path):
+            try:
+                with open(response_path) as f:
+                    data = json.load(f)
+                os.remove(response_path)
+                return data
+            except (json.JSONDecodeError, OSError):
+                pass
+        time.sleep(interval)
+        if interval < 2.0:
+            interval = min(interval * 1.2, 2.0)
+
+    return None
 
 
 def _poll_response(ipc_dir, event_id, timeout):
