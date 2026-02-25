@@ -229,7 +229,6 @@ def permission_keyboard(event_id):
 
 def stop_keyboard(event_id, session_id):
     return {"inline_keyboard": [
-        [{"text": "🛑 Let it stop", "callback_data": f"stop:{event_id}"}],
         [{"text": "🔚 End AFK Session", "callback_data": f"end_session:{session_id}"}],
     ]}
 
