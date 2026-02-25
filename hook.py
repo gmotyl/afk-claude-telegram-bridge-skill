@@ -818,8 +818,9 @@ def _check_kill_file(ipc_dir):
 
 
 def _poll_response_or_kill(ipc_dir, event_id, timeout):
-    """Poll for response, but exit early if kill file appears."""
+    """Poll for response, but exit early if kill or force_clear appears."""
     response_path = os.path.join(ipc_dir, f"response-{event_id}.json")
+    force_clear_path = os.path.join(ipc_dir, "force_clear")
     deadline = time.time() + timeout
     interval = 0.5
 
@@ -834,6 +835,15 @@ def _poll_response_or_kill(ipc_dir, event_id, timeout):
                 pass
             log.info(f"[POLL] Kill file detected: {reason}")
             return {"_killed": True, "_reason": reason}
+
+        # Check force_clear
+        if os.path.exists(force_clear_path):
+            try:
+                os.remove(force_clear_path)
+            except OSError:
+                pass
+            log.info("[POLL] force_clear detected, returning /clear instruction")
+            return {"instruction": "/clear"}
 
         if os.path.exists(response_path):
             try:
@@ -853,10 +863,20 @@ def _poll_response_or_kill(ipc_dir, event_id, timeout):
 def _poll_response(ipc_dir, event_id, timeout):
     """Poll for a response file written by the daemon. Returns dict or None."""
     response_path = os.path.join(ipc_dir, f"response-{event_id}.json")
+    force_clear_path = os.path.join(ipc_dir, "force_clear")
     deadline = time.time() + timeout
     interval = 0.5
 
     while time.time() < deadline:
+        # Check force_clear first (bypasses stuck IPC)
+        if os.path.exists(force_clear_path):
+            try:
+                os.remove(force_clear_path)
+            except OSError:
+                pass
+            log.info("[POLL] force_clear detected, returning allow decision")
+            return {"decision": "allow"}
+
         if os.path.exists(response_path):
             try:
                 with open(response_path) as f:
@@ -866,7 +886,6 @@ def _poll_response(ipc_dir, event_id, timeout):
             except (json.JSONDecodeError, OSError):
                 pass
         time.sleep(interval)
-        # Gradually increase poll interval (0.5s → 1s → 2s)
         if interval < 2.0:
             interval = min(interval * 1.2, 2.0)
 

@@ -645,6 +645,15 @@ class BridgeDaemon:
                 except OSError:
                     pass
 
+            # Always write force_clear as backup
+            force_clear_path = IPC_DIR / target_sid / "force_clear"
+            try:
+                with open(force_clear_path, "w") as f:
+                    f.write(str(time.time()))
+                log.info(f"[CLEAR] Wrote force_clear for session {target_sid[:8]}")
+            except OSError:
+                pass
+
             self.tg.answer_callback(cq_id, "Clearing context...")
             thread_id = self.session_threads.get(target_sid)
             if thread_id:
@@ -804,6 +813,16 @@ class BridgeDaemon:
                     try:
                         with open(queued_path, "w") as f:
                             json.dump({"instruction": instruction, "timestamp": time.time()}, f)
+                    except OSError:
+                        pass
+
+                # Always write force_clear as backup (bypasses stuck IPC)
+                if command == "clear":
+                    force_clear_path = IPC_DIR / target_session / "force_clear"
+                    try:
+                        with open(force_clear_path, "w") as f:
+                            f.write(str(time.time()))
+                        log.info(f"[CLEAR] Wrote force_clear for session {target_session[:8]}")
                     except OSError:
                         pass
 
