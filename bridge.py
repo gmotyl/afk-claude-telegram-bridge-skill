@@ -226,9 +226,10 @@ def permission_keyboard(event_id):
     ]}
 
 
-def stop_keyboard(event_id):
+def stop_keyboard(event_id, session_id):
     return {"inline_keyboard": [
-        [{"text": "🛑 Let it stop", "callback_data": f"stop:{event_id}"}]
+        [{"text": "🛑 Let it stop", "callback_data": f"stop:{event_id}"}],
+        [{"text": "🔚 End AFK Session", "callback_data": f"end_session:{session_id}"}],
     ]}
 
 
@@ -433,7 +434,7 @@ class BridgeDaemon:
                 text = f"<i>Reply to give next instruction...</i>"
             else:
                 text = format_stop_message(event, slot)
-            kb = stop_keyboard(event_id)
+            kb = stop_keyboard(event_id, session_id)
             result = self._send_to_session(text, session_id, reply_markup=kb)
             if result and result.get("ok"):
                 self.pending_events[event_id] = {
@@ -494,7 +495,7 @@ class BridgeDaemon:
         action, event_id = data.split(":", 1)
 
         # Context management callbacks don't use pending_events
-        if action in ("compact", "clear", "dismiss_ctx"):
+        if action in ("compact", "clear", "dismiss_ctx", "end_session"):
             pass  # handled below, skip pending lookup
         else:
             pending = self.pending_events.get(event_id)
@@ -525,6 +526,20 @@ class BridgeDaemon:
             self.tg.answer_callback(cq_id, "Stopping")
             self.tg.edit_message(msg_id, f"🛑 Stopped")
             del self.pending_events[event_id]
+
+        elif action == "end_session":
+            target_sid = event_id  # callback_data is "end_session:{session_id}"
+            self.tg.answer_callback(cq_id, "Ending AFK session...")
+            thread_id = self.session_threads.get(target_sid)
+            if thread_id:
+                self.tg.send_message("👋 <b>AFK Session ended from Telegram</b>", thread_id=thread_id)
+            self._kill_session(target_sid, "ended from Telegram")
+            # Also resolve any pending stop events for this session
+            for eid in list(self.pending_events.keys()):
+                if self.pending_events[eid]["session_id"] == target_sid:
+                    del self.pending_events[eid]
+            # Clean up typing
+            self.typing_sessions.pop(target_sid, None)
 
         elif action == "compact":
             # session_id is in event_id position for context commands
@@ -668,6 +683,30 @@ class BridgeDaemon:
                     f"{status}{pending_info}",
                     thread_id=msg_thread_id,
                 )
+            else:
+                self.tg.send_message("❓ No session found for this topic", thread_id=msg_thread_id)
+            return
+
+        # Handle /end — terminate AFK session from Telegram
+        if text.lower() == "/end":
+            target_session = None
+            for sid, t_id in self.session_threads.items():
+                if t_id == msg_thread_id:
+                    target_session = sid
+                    break
+            if not target_session:
+                state = load_state()
+                active = get_active_sessions(state)
+                if len(active) == 1:
+                    target_session = list(active.keys())[0]
+
+            if target_session:
+                self.tg.send_message("👋 <b>AFK Session ended from Telegram</b>", thread_id=msg_thread_id)
+                self._kill_session(target_session, "ended from Telegram via /end")
+                for eid in list(self.pending_events.keys()):
+                    if self.pending_events[eid]["session_id"] == target_session:
+                        del self.pending_events[eid]
+                self.typing_sessions.pop(target_session, None)
             else:
                 self.tg.send_message("❓ No session found for this topic", thread_id=msg_thread_id)
             return

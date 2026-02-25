@@ -698,7 +698,9 @@ def cmd_hook():
 
             # Kill file detected — exit cleanly
             if response and response.get("_killed"):
-                log.info("[STOP] Killed by daemon (topic deleted)")
+                reason = response.get("_reason", "topic deleted")
+                print(f"\n🔚 AFK session ended from Telegram ({reason}). Returning control to local console.", file=sys.stderr)
+                log.info(f"[STOP] Killed by daemon: {reason}")
                 sys.exit(0)
 
             # Got instruction from user
@@ -792,8 +794,15 @@ def _poll_response_or_kill(ipc_dir, event_id, timeout):
 
     while time.time() < deadline:
         if _check_kill_file(ipc_dir):
-            log.info("[POLL] Kill file detected, exiting")
-            return {"_killed": True}
+            reason = "unknown"
+            kill_path = os.path.join(ipc_dir, "kill")
+            try:
+                with open(kill_path) as f:
+                    reason = f.read().strip() or "unknown"
+            except OSError:
+                pass
+            log.info(f"[POLL] Kill file detected: {reason}")
+            return {"_killed": True, "_reason": reason}
 
         if os.path.exists(response_path):
             try:
