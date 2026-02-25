@@ -454,6 +454,23 @@ def cmd_deactivate(session_id):
                     break
                 time.sleep(0.3)
 
+            # Fallback: if daemon didn't process, delete topic directly
+            if not os.path.exists(processed_path):
+                thread_id = slots.get(removed_slot, {}).get("thread_id")
+                if thread_id:
+                    log.info(f"[DEACTIVATE] Daemon didn't process, deleting topic {thread_id} directly")
+                    try:
+                        config = load_config()
+                        token = config.get("bot_token", "")
+                        chat_id = config.get("chat_id", "")
+                        if token and chat_id:
+                            url = f"https://api.telegram.org/bot{token}/deleteForumTopic"
+                            data = json.dumps({"chat_id": chat_id, "message_thread_id": thread_id}).encode()
+                            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+                            urllib.request.urlopen(req, timeout=5)
+                    except Exception as e:
+                        log.error(f"[DEACTIVATE] Fallback topic delete failed: {e}")
+
         # NOW remove the slot from state.json (after daemon has processed the event)
         del slots[removed_slot]
 

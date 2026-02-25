@@ -360,6 +360,16 @@ class BridgeDaemon:
                 thread_id = res["result"]["message_thread_id"]
                 self.session_threads[session_id] = thread_id
                 log.info(f"[ACTIVATION] Topic created: thread_id={thread_id}")
+                # Persist thread_id to state.json so hook.py can delete topic as fallback
+                try:
+                    st = load_state()
+                    for s_num, s_info in st.get("slots", {}).items():
+                        if s_info.get("session_id") == session_id:
+                            s_info["thread_id"] = thread_id
+                            save_state(st)
+                            break
+                except Exception as e:
+                    log.error(f"[ACTIVATION] Failed to persist thread_id: {e}")
             else:
                 log.error(f"[ACTIVATION] Failed to create topic: {res}")
 
@@ -903,7 +913,7 @@ class BridgeDaemon:
             log.error("Failed to write response %s: %s", response_path, e)
 
     def _kill_session(self, session_id, reason="topic deleted"):
-        """Write kill file and clean up session state."""
+        """Write kill file, delete topic, and clean up session state."""
         ipc_session_dir = IPC_DIR / session_id
         kill_path = ipc_session_dir / "kill"
         try:
@@ -912,6 +922,12 @@ class BridgeDaemon:
             log.info(f"[KILL] Wrote kill file for session {session_id[:8]}: {reason}")
         except OSError as e:
             log.error(f"[KILL] Failed to write kill file: {e}")
+
+        # Delete the forum topic
+        topic_id = self.session_threads.get(session_id)
+        if topic_id:
+            log.info(f"[KILL] Deleting topic {topic_id} for session {session_id[:8]}")
+            self.tg.delete_forum_topic(topic_id)
 
         # Clean up daemon state
         if session_id in self.session_threads:
