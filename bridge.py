@@ -248,6 +248,9 @@ class BridgeDaemon:
         # Context management: session_id -> interaction count
         self.interaction_counts = {}
         self.context_warning_sent = {}  # session_id -> threshold at which warning was sent
+        # Typing indicator: session_id -> True when Claude is processing
+        self.typing_sessions = {}
+        self.typing_last_sent = {}  # session_id -> timestamp of last typing action
 
         signal.signal(signal.SIGTERM, self._handle_sigterm)
         signal.signal(signal.SIGINT, self._handle_sigterm)
@@ -272,6 +275,8 @@ class BridgeDaemon:
             if now - last_event_scan > EVENT_SCAN_INTERVAL:
                 self._scan_events()
                 last_event_scan = now
+
+            self._update_typing()
 
             try:
                 updates = self.tg.get_updates(timeout=2)
@@ -332,6 +337,10 @@ class BridgeDaemon:
         event_id = event.get("id", "")
         thread_id = self.session_threads.get(session_id)
         log.info(f"[EVENT] Processing {etype} (id={event_id}) for session {session_id[:8]}... thread={thread_id}")
+
+        # Stop typing when we hear back from Claude
+        if etype in ("stop", "permission_request", "response", "notification"):
+            self.typing_sessions[session_id] = False
 
         if etype == "activation":
             project = event.get("project", "Unknown")
@@ -497,6 +506,7 @@ class BridgeDaemon:
 
         if action == "allow":
             self._write_response(ipc_session_dir, event_id, {"decision": "allow"})
+            self.typing_sessions[session_id] = True
             self.tg.answer_callback(cq_id, "Approved")
             self.tg.edit_message(msg_id, f"✅ Approved")
             del self.pending_events[event_id]
@@ -688,6 +698,7 @@ class BridgeDaemon:
         if stop_event_id:
             # Natychmiastowe wysłanie instrukcji
             self._write_response(ipc_session_dir, stop_event_id, {"instruction": text})
+            self.typing_sessions[target_session] = True
             msg_id = self.pending_events[stop_event_id]["message_id"]
             self.tg.edit_message(msg_id, f"▶️ Continuing: <i>{escape_html(text[:200])}</i>")
             del self.pending_events[stop_event_id]
@@ -812,6 +823,19 @@ class BridgeDaemon:
         ]}
         self.tg.send_message(text, thread_id=thread_id, reply_markup=kb)
         log.info(f"[CONTEXT] Warning sent for session {session_id[:8]} at count={count}")
+
+    def _update_typing(self):
+        """Send typing action for sessions where Claude is working."""
+        now = time.time()
+        for session_id in list(self.typing_sessions.keys()):
+            if not self.typing_sessions.get(session_id):
+                continue
+            last = self.typing_last_sent.get(session_id, 0)
+            if now - last >= 4.5:
+                thread_id = self.session_threads.get(session_id)
+                if thread_id:
+                    self.tg.send_chat_action("typing", thread_id=thread_id)
+                self.typing_last_sent[session_id] = now
 
 
 if __name__ == "__main__":
