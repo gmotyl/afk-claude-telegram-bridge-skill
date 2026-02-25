@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 telegram-bridge bridge.py — Telegram long-polling daemon.
-Wersja z obsługą Telegram Topics (Wątków) oraz Kolejkowaniem Wiadomości (Message Buffer).
+Supports Telegram Topics and Message Buffer for queuing instructions.
 """
 import json
 import logging
@@ -75,7 +75,7 @@ class TelegramAPI:
         return self._request("setMyCommands", data)
 
     def create_forum_topic(self, name):
-        """Tworzy nowy wątek (Topic) w Grupie Telegrama"""
+        """Create a new forum topic in the Telegram group"""
         data = {
             "chat_id": self.chat_id,
             "name": name
@@ -83,7 +83,7 @@ class TelegramAPI:
         return self._request("createForumTopic", data)
 
     def delete_forum_topic(self, thread_id):
-        """Usuwa wątek (Topic) z Grupy Telegrama"""
+        """Delete a forum topic from the Telegram group"""
         data = {
             "chat_id": self.chat_id,
             "message_thread_id": thread_id
@@ -242,7 +242,7 @@ class BridgeDaemon:
         self.running = True
         self.event_positions = {}
         self.pending_events = {}
-        # Pamięć: session_id -> message_thread_id (Topic ID)
+        # Map: session_id -> message_thread_id (Topic ID)
         self.session_threads = {}
         # Idle ping tracking: session_id -> last_ping_timestamp
         self.last_idle_ping = {}
@@ -681,7 +681,7 @@ class BridgeDaemon:
         text = msg.get("text", "").strip()
         chat_id = str(msg.get("chat", {}).get("id", ""))
 
-        # Wyciągamy ID tematu (wątku) z wiadomości
+        # Extract topic thread ID from message
         msg_thread_id = msg.get("message_thread_id")
 
         if chat_id != self.tg.chat_id or not text:
@@ -849,25 +849,25 @@ class BridgeDaemon:
                     self.approval_counts.pop(target_session, None)
             return
 
-        # Szukamy sesji, do której przypisany jest ten konkretny Temat
+        # Find session assigned to this topic thread
         target_session = None
         for sid, t_id in self.session_threads.items():
             if t_id == msg_thread_id:
                 target_session = sid
                 break
 
-        # Fallback - jeśli nie ma topiców, uderz do jedynej aktywnej sesji
+        # Fallback — if no topic match, route to the only active session
         if not target_session:
             state = load_state()
             active = get_active_sessions(state)
             if len(active) == 1:
                 target_session = list(active.keys())[0]
             else:
-                return  # Ignorujemy wiadomości wysłane w głównym czacie, jeśli jest kilka sesji
+                return  # Ignore messages in main chat when multiple sessions active
 
         ipc_session_dir = IPC_DIR / target_session
 
-        # Szukamy, czy Claude na nas czeka (status "stop")
+        # Check if Claude is waiting for instruction (stop event pending)
         stop_event_id = None
         for eid, info in self.pending_events.items():
             if info["session_id"] == target_session and info["type"] == "stop":
@@ -875,16 +875,16 @@ class BridgeDaemon:
                 break
 
         if stop_event_id:
-            # Natychmiastowe wysłanie instrukcji
+            # Send instruction immediately — Claude is waiting
             self._write_response(ipc_session_dir, stop_event_id, {"instruction": text})
             self.typing_sessions[target_session] = True
             msg_id = self.pending_events[stop_event_id]["message_id"]
             self.tg.edit_message(msg_id, f"▶️ Continuing: <i>{escape_html(text[:200])}</i>")
             del self.pending_events[stop_event_id]
-            self.tg.send_message(f"📨 Wysłano do Agenta", thread_id=msg_thread_id)
+            self.tg.send_message(f"📨 Sent to Agent", thread_id=msg_thread_id)
             self._increment_interaction(target_session)
         else:
-            # MESSAGE BUFFER: Claude pracuje, więc dołączamy to do kolejki
+            # MESSAGE BUFFER: Claude is busy, queue the instruction
             queued_path = ipc_session_dir / "queued_instruction.json"
             existing_instruction = ""
             if queued_path.exists():
@@ -899,7 +899,7 @@ class BridgeDaemon:
             try:
                 with open(queued_path, "w") as f:
                     json.dump({"instruction": final_instruction, "timestamp": time.time()}, f)
-                self.tg.send_message(f"📥 Dodano do kolejki instrukcji.", thread_id=msg_thread_id)
+                self.tg.send_message(f"📥 Queued instruction (agent busy).", thread_id=msg_thread_id)
                 self._increment_interaction(target_session)
             except OSError:
                 pass
