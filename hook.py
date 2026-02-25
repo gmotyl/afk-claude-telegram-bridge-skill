@@ -591,18 +591,49 @@ def cmd_hook():
     if hook_event == "PermissionRequest":
         tool_name = event_data.get("tool_name", "")
 
-        # Auto-approve read-only tools
+        # Auto-approve: check tool name + optional path matching
         if tool_name in auto_approve:
-            result = {
-                "hookSpecificOutput": {
-                    "hookEventName": "PermissionRequest",
-                    "decision": {
-                        "behavior": "allow",
+            auto_paths = config.get("auto_approve_paths", [])
+            if auto_paths:
+                # Extract path from tool input
+                tool_input = event_data.get("tool_input", {})
+                file_path = (tool_input.get("file_path") or
+                             tool_input.get("path") or
+                             tool_input.get("notebook_path") or "")
+                if file_path:
+                    import fnmatch
+                    path_approved = any(fnmatch.fnmatch(file_path, pat) for pat in auto_paths)
+                    if not path_approved:
+                        pass  # Fall through to Telegram approval
+                    else:
+                        result = {
+                            "hookSpecificOutput": {
+                                "hookEventName": "PermissionRequest",
+                                "decision": {"behavior": "allow"},
+                            },
+                        }
+                        json.dump(result, sys.stdout)
+                        sys.exit(0)
+                else:
+                    # Tool has no path (e.g. WebSearch) — auto-approve by tool name alone
+                    result = {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PermissionRequest",
+                            "decision": {"behavior": "allow"},
+                        },
+                    }
+                    json.dump(result, sys.stdout)
+                    sys.exit(0)
+            else:
+                # No path rules configured — auto-approve by tool name alone (existing behavior)
+                result = {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PermissionRequest",
+                        "decision": {"behavior": "allow"},
                     },
-                },
-            }
-            json.dump(result, sys.stdout)
-            sys.exit(0)
+                }
+                json.dump(result, sys.stdout)
+                sys.exit(0)
 
         # Write event for Telegram approval
         event_id = str(uuid.uuid4())[:8]
