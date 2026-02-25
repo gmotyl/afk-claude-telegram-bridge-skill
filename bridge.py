@@ -9,6 +9,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -252,6 +253,11 @@ class BridgeDaemon:
         # Typing indicator: session_id -> True when Claude is processing
         self.typing_sessions = {}
         self.typing_last_sent = {}  # session_id -> timestamp of last typing action
+        # Permission batching: session_id -> {events: [...], timer_start: float}
+        self.permission_batch = {}
+        # Session trust: session_id -> True when user trusts all permissions
+        self.trusted_sessions = {}
+        self.approval_counts = {}  # session_id -> count of individual approvals
 
         signal.signal(signal.SIGTERM, self._handle_sigterm)
         signal.signal(signal.SIGINT, self._handle_sigterm)
@@ -279,6 +285,7 @@ class BridgeDaemon:
 
             self._update_typing()
             self._check_stale_events()
+            self._flush_permission_batches()
 
             try:
                 updates = self.tg.get_updates(timeout=2)
@@ -383,20 +390,18 @@ class BridgeDaemon:
 
         elif etype == "permission_request":
             self._increment_interaction(session_id)
-            text = format_permission_message(event, slot)
-            kb = permission_keyboard(event_id)
-            result = self._send_to_session(text, session_id, reply_markup=kb)
-            if result and result.get("ok"):
-                self.pending_events[event_id] = {
-                    "session_id": session_id,
-                    "type": "permission_request",
-                    "message_id": result["result"]["message_id"],
+            batch_window = self.config.get("permission_batch_window_seconds", 2)
+
+            if session_id not in self.permission_batch:
+                self.permission_batch[session_id] = {
+                    "events": [],
+                    "timer_start": time.time(),
+                    "thread_id": thread_id,
                     "slot": slot,
-                    "created_at": time.time()
                 }
-                log.info(f"[PERMISSION] Sent to Telegram, msg_id={result['result']['message_id']}")
-            else:
-                log.error(f"[PERMISSION] Failed to send: {result}")
+
+            self.permission_batch[session_id]["events"].append(event)
+            log.info(f"[PERMISSION] Queued event {event_id} for batching ({len(self.permission_batch[session_id]['events'])} in batch)")
 
         elif etype == "stop":
             self._increment_interaction(session_id)
@@ -495,7 +500,7 @@ class BridgeDaemon:
         action, event_id = data.split(":", 1)
 
         # Context management callbacks don't use pending_events
-        if action in ("compact", "clear", "dismiss_ctx", "end_session"):
+        if action in ("compact", "clear", "dismiss_ctx", "end_session", "approve_all", "deny_all", "trust_session"):
             pass  # handled below, skip pending lookup
         else:
             pending = self.pending_events.get(event_id)
@@ -514,6 +519,7 @@ class BridgeDaemon:
             self.tg.answer_callback(cq_id, "Approved")
             self.tg.edit_message(msg_id, f"✅ Approved")
             del self.pending_events[event_id]
+            self._track_approval(session_id)
 
         elif action == "deny":
             self._write_response(ipc_session_dir, event_id, {"decision": "deny", "message": "Denied via Telegram"})
@@ -540,6 +546,45 @@ class BridgeDaemon:
                     del self.pending_events[eid]
             # Clean up typing
             self.typing_sessions.pop(target_sid, None)
+
+        elif action in ("approve_all", "deny_all"):
+            batch_id = event_id  # callback_data is "approve_all:{batch_id}"
+            batch_info = self.pending_events.get(batch_id)
+            if not batch_info:
+                self.tg.answer_callback(cq_id, "Batch expired")
+                return
+            session_id = batch_info["session_id"]
+            ipc_dir = IPC_DIR / session_id
+            decision = "allow" if action == "approve_all" else "deny"
+            msg = "" if action == "approve_all" else "Denied via Telegram (batch)"
+
+            for eid in batch_info.get("event_ids", []):
+                if decision == "allow":
+                    self._write_response(ipc_dir, eid, {"decision": "allow"})
+                else:
+                    self._write_response(ipc_dir, eid, {"decision": "deny", "message": msg})
+
+            count = len(batch_info.get("event_ids", []))
+            label = "Approved" if action == "approve_all" else "Denied"
+            self.tg.answer_callback(cq_id, f"{label} {count} requests")
+            self.tg.edit_message(batch_info["message_id"], f"{'✅' if decision == 'allow' else '❌'} {label} all ({count})")
+            del self.pending_events[batch_id]
+
+            # Track approvals for session trust
+            if decision == "allow":
+                self._track_approval(session_id, count)
+            # Start typing if approved
+            if decision == "allow":
+                self.typing_sessions[session_id] = True
+
+        elif action == "trust_session":
+            target_sid = event_id
+            self.trusted_sessions[target_sid] = True
+            self.tg.answer_callback(cq_id, "Session trusted!")
+            thread_id = self.session_threads.get(target_sid)
+            if thread_id:
+                self.tg.send_message("🔓 <b>Session trusted</b> — all permissions will auto-approve", thread_id=thread_id)
+            log.info(f"[TRUST] Session {target_sid[:8]} trusted by user")
 
         elif action == "compact":
             # session_id is in event_id position for context commands
@@ -608,6 +653,8 @@ class BridgeDaemon:
             # Reset interaction counter
             self.interaction_counts[target_sid] = 0
             self.context_warning_sent[target_sid] = 0
+            self.trusted_sessions.pop(target_sid, None)
+            self.approval_counts.pop(target_sid, None)
 
         elif action == "dismiss_ctx":
             self.tg.answer_callback(cq_id, "Dismissed")
@@ -770,6 +817,8 @@ class BridgeDaemon:
                 if command == "clear":
                     self.interaction_counts[target_session] = 0
                     self.context_warning_sent[target_session] = 0
+                    self.trusted_sessions.pop(target_session, None)
+                    self.approval_counts.pop(target_session, None)
             return
 
         # Szukamy sesji, do której przypisany jest ten konkretny Temat
@@ -958,6 +1007,105 @@ class BridgeDaemon:
                     )
                 self.context_warning_sent[warned_key] = True
                 log.warning(f"[STALE] Event {event_id} pending for {age}s")
+
+    def _flush_permission_batches(self):
+        """Send batched permission requests that have waited long enough."""
+        batch_window = self.config.get("permission_batch_window_seconds", 2)
+        now = time.time()
+
+        for session_id in list(self.permission_batch.keys()):
+            batch = self.permission_batch[session_id]
+            if now - batch["timer_start"] < batch_window:
+                continue  # Still collecting
+
+            events = batch["events"]
+            thread_id = batch["thread_id"]
+            slot = batch["slot"]
+            del self.permission_batch[session_id]
+
+            if len(events) == 1:
+                # Single request — use normal format
+                event = events[0]
+                event_id = event["id"]
+                text = format_permission_message(event, slot)
+                # Check session trust
+                if self._is_session_trusted(session_id):
+                    self._auto_approve_permission(event, session_id)
+                    continue
+                kb = permission_keyboard(event_id)
+                result = self._send_to_session(text, session_id, reply_markup=kb)
+                if result and result.get("ok"):
+                    self.pending_events[event_id] = {
+                        "session_id": session_id,
+                        "type": "permission_request",
+                        "message_id": result["result"]["message_id"],
+                        "slot": slot,
+                        "created_at": time.time(),
+                    }
+            else:
+                # Batch — combined message with Approve All
+                batch_id = str(uuid.uuid4())[:8]
+                lines = [f"🔐 <b>Permission Requests ({len(events)})</b>\n"]
+                event_ids = []
+                for i, ev in enumerate(events, 1):
+                    tool = ev.get("tool_name", "?")
+                    desc = ev.get("description", "")
+                    short_desc = desc.split("\n")[0][:80] if desc else ""
+                    lines.append(f"{i}. <b>{escape_html(tool)}</b>: {escape_html(short_desc)}")
+                    event_ids.append(ev["id"])
+
+                text = "\n".join(lines)
+                # Check session trust
+                if self._is_session_trusted(session_id):
+                    for ev in events:
+                        self._auto_approve_permission(ev, session_id)
+                    continue
+
+                kb = {"inline_keyboard": [
+                    [{"text": f"✅ Approve All ({len(events)})", "callback_data": f"approve_all:{batch_id}"},
+                     {"text": "❌ Deny All", "callback_data": f"deny_all:{batch_id}"}],
+                ]}
+                result = self._send_to_session(text, session_id, reply_markup=kb)
+                if result and result.get("ok"):
+                    self.pending_events[batch_id] = {
+                        "session_id": session_id,
+                        "type": "permission_batch",
+                        "message_id": result["result"]["message_id"],
+                        "event_ids": event_ids,
+                        "slot": slot,
+                        "created_at": time.time(),
+                    }
+
+    def _is_session_trusted(self, session_id):
+        return self.trusted_sessions.get(session_id, False)
+
+    def _track_approval(self, session_id, count=1):
+        """Track approval count and offer trust after threshold."""
+        self.approval_counts[session_id] = self.approval_counts.get(session_id, 0) + count
+        threshold = self.config.get("session_trust_threshold", 3)
+        if self.approval_counts[session_id] >= threshold and not self._is_session_trusted(session_id):
+            thread_id = self.session_threads.get(session_id)
+            if thread_id:
+                kb = {"inline_keyboard": [
+                    [{"text": "🔓 Trust this session", "callback_data": f"trust_session:{session_id}"}],
+                ]}
+                self.tg.send_message(
+                    f"💡 You've approved {self.approval_counts[session_id]} requests. Trust this session to auto-approve?",
+                    thread_id=thread_id,
+                    reply_markup=kb,
+                )
+
+    def _auto_approve_permission(self, event, session_id):
+        """Auto-approve a permission request (for trusted sessions)."""
+        event_id = event["id"]
+        ipc_dir = IPC_DIR / session_id
+        self._write_response(ipc_dir, event_id, {"decision": "allow"})
+        tool_name = event.get("tool_name", "?")
+        thread_id = self.session_threads.get(session_id)
+        if thread_id:
+            self.tg.send_message(f"✅ Auto-approved (trusted): {escape_html(tool_name)}", thread_id=thread_id)
+        self.typing_sessions[session_id] = True
+        log.info(f"[TRUST] Auto-approved {tool_name} for trusted session {session_id[:8]}")
 
 
 if __name__ == "__main__":
