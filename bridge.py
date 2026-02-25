@@ -277,6 +277,7 @@ class BridgeDaemon:
                 last_event_scan = now
 
             self._update_typing()
+            self._check_stale_events()
 
             try:
                 updates = self.tg.get_updates(timeout=2)
@@ -389,7 +390,8 @@ class BridgeDaemon:
                     "session_id": session_id,
                     "type": "permission_request",
                     "message_id": result["result"]["message_id"],
-                    "slot": slot
+                    "slot": slot,
+                    "created_at": time.time()
                 }
                 log.info(f"[PERMISSION] Sent to Telegram, msg_id={result['result']['message_id']}")
             else:
@@ -438,7 +440,8 @@ class BridgeDaemon:
                     "session_id": session_id,
                     "type": "stop",
                     "message_id": result["result"]["message_id"],
-                    "slot": slot
+                    "slot": slot,
+                    "created_at": time.time()
                 }
                 log.info(f"[STOP] Sent to Telegram, msg_id={result['result']['message_id']}")
             else:
@@ -608,6 +611,66 @@ class BridgeDaemon:
         # e.g. "/clear@Clade_motyl_ai_bot" -> "/clear"
         if text.startswith("/") and "@" in text.split()[0]:
             text = text.split("@")[0]
+
+        # Handle /ping — daemon answers directly, no IPC needed
+        if text.lower() == "/ping":
+            target_session = None
+            for sid, t_id in self.session_threads.items():
+                if t_id == msg_thread_id:
+                    target_session = sid
+                    break
+            if not target_session:
+                state = load_state()
+                active = get_active_sessions(state)
+                if len(active) == 1:
+                    target_session = list(active.keys())[0]
+
+            if target_session:
+                # Check last event timestamp
+                event_file = IPC_DIR / target_session / "events.jsonl"
+                last_activity = 0
+                try:
+                    if event_file.exists():
+                        with open(event_file) as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        ev = json.loads(line)
+                                        ts = ev.get("timestamp", 0)
+                                        if ts > last_activity:
+                                            last_activity = ts
+                                    except json.JSONDecodeError:
+                                        pass
+                except OSError:
+                    pass
+
+                now = time.time()
+                if last_activity > 0:
+                    age = int(now - last_activity)
+                    if age < 60:
+                        status = f"🏓 Agent alive — last activity {age}s ago"
+                    elif age < 300:
+                        status = f"⚠️ Agent slow — last activity {age}s ago. Try /clear if stuck"
+                    else:
+                        status = f"💀 Agent likely stuck — no activity for {age}s. Use /clear to restart"
+                else:
+                    status = "❓ No activity data available"
+
+                # Check if there's a pending event waiting for response
+                pending_info = ""
+                for eid, info in self.pending_events.items():
+                    if info["session_id"] == target_session:
+                        pending_info = f"\n📋 Pending: {info['type']} (event {eid})"
+                        break
+
+                self.tg.send_message(
+                    f"{status}{pending_info}",
+                    thread_id=msg_thread_id,
+                )
+            else:
+                self.tg.send_message("❓ No session found for this topic", thread_id=msg_thread_id)
+            return
 
         # Intercept context management commands
         COMPACT_INSTRUCTION = (
@@ -836,6 +899,26 @@ class BridgeDaemon:
                 if thread_id:
                     self.tg.send_chat_action("typing", thread_id=thread_id)
                 self.typing_last_sent[session_id] = now
+
+    def _check_stale_events(self):
+        """Warn if pending events have been waiting too long."""
+        stale_seconds = self.config.get("stale_warning_seconds", 90)
+        now = time.time()
+        for event_id, info in list(self.pending_events.items()):
+            created = info.get("created_at", now)
+            session_id = info["session_id"]
+            warned_key = f"stale_{event_id}"
+
+            if now - created > stale_seconds and warned_key not in self.context_warning_sent:
+                age = int(now - created)
+                thread_id = self.session_threads.get(session_id)
+                if thread_id:
+                    self.tg.send_message(
+                        f"⚠️ Agent may be unresponsive — pending {info['type']} for {age}s.\nTry /ping or /clear",
+                        thread_id=thread_id,
+                    )
+                self.context_warning_sent[warned_key] = True
+                log.warning(f"[STALE] Event {event_id} pending for {age}s")
 
 
 if __name__ == "__main__":
