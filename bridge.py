@@ -677,6 +677,25 @@ class BridgeDaemon:
         elif action == "dismiss_ctx":
             self.tg.answer_callback(cq_id, "Dismissed")
 
+    def _get_session_for_message(self, msg_thread_id):
+        """Find session ID for a given message thread ID.
+
+        Returns the session ID mapped to this topic, or the only active
+        session if no topic match is found. Returns None if no session found.
+        """
+        # Try to find session by topic thread ID
+        for sid, t_id in self.session_threads.items():
+            if t_id == msg_thread_id:
+                return sid
+
+        # Fallback — if no topic match, route to the only active session
+        state = load_state()
+        active = get_active_sessions(state)
+        if len(active) == 1:
+            return list(active.keys())[0]
+
+        return None
+
     def _handle_message(self, msg):
         text = msg.get("text", "").strip()
         chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -694,16 +713,7 @@ class BridgeDaemon:
 
         # Handle /ping — daemon answers directly, no IPC needed
         if text.lower() == "/ping":
-            target_session = None
-            for sid, t_id in self.session_threads.items():
-                if t_id == msg_thread_id:
-                    target_session = sid
-                    break
-            if not target_session:
-                state = load_state()
-                active = get_active_sessions(state)
-                if len(active) == 1:
-                    target_session = list(active.keys())[0]
+            target_session = self._get_session_for_message(msg_thread_id)
 
             if target_session:
                 # Check last event timestamp
@@ -754,16 +764,7 @@ class BridgeDaemon:
 
         # Handle /end — terminate AFK session from Telegram
         if text.lower() == "/end":
-            target_session = None
-            for sid, t_id in self.session_threads.items():
-                if t_id == msg_thread_id:
-                    target_session = sid
-                    break
-            if not target_session:
-                state = load_state()
-                active = get_active_sessions(state)
-                if len(active) == 1:
-                    target_session = list(active.keys())[0]
+            target_session = self._get_session_for_message(msg_thread_id)
 
             if target_session:
                 self.tg.send_message("👋 <b>AFK Session ended from Telegram</b>", thread_id=msg_thread_id)
