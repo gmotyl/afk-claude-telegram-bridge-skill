@@ -67,6 +67,8 @@ class TelegramAPI:
             "commands": [
                 {"command": "compact", "description": "Compress conversation context"},
                 {"command": "clear", "description": "Clear conversation history"},
+                {"command": "ping", "description": "Check if agent is alive"},
+                {"command": "end", "description": "End AFK session from Telegram"},
             ]
         }
         return self._request("setMyCommands", data)
@@ -123,6 +125,16 @@ class TelegramAPI:
         if text:
             data["text"] = text
         return self._request("answerCallbackQuery", data)
+
+    def send_chat_action(self, action="typing", thread_id=None):
+        """Send chat action (typing indicator) to a topic."""
+        data = {
+            "chat_id": self.chat_id,
+            "action": action,
+        }
+        if thread_id:
+            data["message_thread_id"] = thread_id
+        return self._request("sendChatAction", data)
 
     def get_updates(self, timeout=POLL_TIMEOUT):
         data = {
