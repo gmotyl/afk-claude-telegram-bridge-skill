@@ -493,6 +493,8 @@ def cmd_activate(session_id, project, topic_name=""):
 
 
         # Check for duplicate project+topic (different session_id, same intent)
+        reuse_thread_id = None
+        reuse_slot = None
         for slot_num, info in slots.items():
             if (info.get("project") == (project or "unknown")
                     and info.get("topic_name") == (topic_name or f"S{slot_num} - {project or 'unknown'}")):
@@ -504,9 +506,12 @@ def cmd_activate(session_id, project, topic_name=""):
                     # Same session already active - just return slot number
                     print(f"Session already active in slot S{slot_num}")
                     return slot_num
-                elif is_active:
-                    # Different session but same project - auto-deactivate old session
-                    log.info(f"[ACTIVATE] Auto-deactivating old session {dup_session_id[:8]} for new {session_id[:8]}")
+                else:
+                    # Different session or stale - reuse thread_id and slot number
+                    reuse_thread_id = info.get("thread_id")
+                    reuse_slot = slot_num
+                    log.info(f"[ACTIVATE] Reattaching: old session {dup_session_id[:8]} → new {session_id[:8]} "
+                            f"(thread_id={reuse_thread_id}, slot=S{slot_num})")
                     del slots[slot_num]
                     # Clean up IPC for old session
                     old_ipc = os.path.join(IPC_DIR, dup_session_id)
@@ -516,18 +521,14 @@ def cmd_activate(session_id, project, topic_name=""):
                         except:
                             pass
                     break  # Continue with new activation
-                else:
-                    # Stale duplicate - clean it up
-                    log.info(f"[ACTIVATE] Cleaning stale duplicate S{slot_num}")
-                    del slots[slot_num]
-                    break  # Continue with new activation
-        # Find next available slot
-        assigned_slot = None
-        for i in range(1, max_slots + 1):
-            s = str(i)
-            if s not in slots:
-                assigned_slot = s
-                break
+        # Find next available slot (prefer reused slot for continuity)
+        assigned_slot = reuse_slot if reuse_slot and reuse_slot not in slots else None
+        if assigned_slot is None:
+            for i in range(1, max_slots + 1):
+                s = str(i)
+                if s not in slots:
+                    assigned_slot = s
+                    break
 
         if assigned_slot is None:
             print(f"All {max_slots} slots are occupied:")
@@ -537,12 +538,16 @@ def cmd_activate(session_id, project, topic_name=""):
             sys.exit(1)
 
         # Claim slot
-        slots[assigned_slot] = {
+        slot_info = {
             "session_id": session_id,
             "project": project or "unknown",
             "topic_name": topic_name or f"S{assigned_slot} - {project or 'unknown'}",
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # Carry forward thread_id for reattachment
+        if reuse_thread_id:
+            slot_info["thread_id"] = reuse_thread_id
+        slots[assigned_slot] = slot_info
 
         # Create IPC directory
         ipc_session_dir = os.path.join(IPC_DIR, session_id)
@@ -577,6 +582,9 @@ def cmd_activate(session_id, project, topic_name=""):
             "session_id": session_id,
             "timestamp": time.time(),
         }
+        # If reattaching, pass existing thread_id so daemon reuses the topic
+        if reuse_thread_id:
+            event["reuse_thread_id"] = reuse_thread_id
         with open(event_file, "a") as f:
             f.write(json.dumps(event) + "\n")
 

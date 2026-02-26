@@ -353,27 +353,73 @@ class BridgeDaemon:
         if etype == "activation":
             project = event.get("project", "Unknown")
             topic_name = event.get("topic_name", f"S{slot} - {project[:15]}")
-            log.info(f"[ACTIVATION] Creating topic '{topic_name}' for {project}")
-            res = self.tg.create_forum_topic(topic_name)
+            reuse_thread_id = event.get("reuse_thread_id")
 
-            if res and res.get("ok"):
-                thread_id = res["result"]["message_thread_id"]
-                self.session_threads[session_id] = thread_id
-                log.info(f"[ACTIVATION] Topic created: thread_id={thread_id}")
-                # Persist thread_id to state.json so hook.py can delete topic as fallback
-                try:
-                    st = load_state()
-                    for s_num, s_info in st.get("slots", {}).items():
-                        if s_info.get("session_id") == session_id:
-                            s_info["thread_id"] = thread_id
-                            save_state(st)
-                            break
-                except Exception as e:
-                    log.error(f"[ACTIVATION] Failed to persist thread_id: {e}")
-            else:
-                log.error(f"[ACTIVATION] Failed to create topic: {res}")
+            if reuse_thread_id:
+                # Clean up old session state that was using this thread_id
+                old_session_id = None
+                for sid, t_id in list(self.session_threads.items()):
+                    if t_id == reuse_thread_id and sid != session_id:
+                        old_session_id = sid
+                        del self.session_threads[sid]
+                        log.info(f"[ACTIVATION] Removed old session mapping {sid[:8]} → thread {t_id}")
+                        break
 
-            self.tg.send_message(f"📡 <b>AFK Activated</b>\nProject: {escape_html(project)}", thread_id=thread_id)
+                # Clean up pending events from old session
+                if old_session_id:
+                    stale_events = [eid for eid, info in self.pending_events.items()
+                                    if info.get("session_id") == old_session_id]
+                    for eid in stale_events:
+                        del self.pending_events[eid]
+                        log.info(f"[ACTIVATION] Cleared stale pending event {eid} from old session")
+                    # Clean up other old session state
+                    self.typing_sessions.pop(old_session_id, None)
+                    self.typing_last_sent.pop(old_session_id, None)
+                    self.last_idle_ping.pop(old_session_id, None)
+                    self.interaction_counts.pop(old_session_id, None)
+                    self.context_warning_sent.pop(old_session_id, None)
+                    self.trusted_sessions.pop(old_session_id, None)
+                    self.approval_counts.pop(old_session_id, None)
+                    self.permission_batch.pop(old_session_id, None)
+
+                # Try to reattach to existing Telegram topic (session was Ctrl+C'd)
+                log.info(f"[ACTIVATION] Attempting reattach to thread_id={reuse_thread_id}")
+                res = self.tg.send_message(f"🔄 <b>AFK Reattached</b>\nProject: {escape_html(project)}", thread_id=reuse_thread_id)
+
+                if res and res.get("ok"):
+                    # Topic still exists — reuse it
+                    thread_id = reuse_thread_id
+                    self.session_threads[session_id] = thread_id
+                    log.info(f"[ACTIVATION] Reattached to existing topic thread_id={thread_id}")
+                else:
+                    # Topic was deleted — fall through to create new one
+                    log.info(f"[ACTIVATION] Topic {reuse_thread_id} gone, creating new one")
+                    reuse_thread_id = None  # Fall through to creation below
+
+            if not reuse_thread_id:
+                # Create new Telegram topic
+                log.info(f"[ACTIVATION] Creating topic '{topic_name}' for {project}")
+                res = self.tg.create_forum_topic(topic_name)
+
+                if res and res.get("ok"):
+                    thread_id = res["result"]["message_thread_id"]
+                    self.session_threads[session_id] = thread_id
+                    log.info(f"[ACTIVATION] Topic created: thread_id={thread_id}")
+                    # Persist thread_id to state.json so hook.py can delete topic as fallback
+                    try:
+                        st = load_state()
+                        for s_num, s_info in st.get("slots", {}).items():
+                            if s_info.get("session_id") == session_id:
+                                s_info["thread_id"] = thread_id
+                                save_state(st)
+                                break
+                    except Exception as e:
+                        log.error(f"[ACTIVATION] Failed to persist thread_id: {e}")
+                else:
+                    log.error(f"[ACTIVATION] Failed to create topic: {res}")
+
+                self.tg.send_message(f"📡 <b>AFK Activated</b>\nProject: {escape_html(project)}", thread_id=thread_id)
+
             self.last_idle_ping[session_id] = time.time()
 
         elif etype == "deactivation":
