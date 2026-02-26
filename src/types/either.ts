@@ -1,6 +1,9 @@
 import * as E from 'fp-ts/Either'
 import { pipe as fpPipe } from 'fp-ts/function'
 
+// Type re-export
+export type Either<L, R> = E.Either<L, R>
+
 // Aliases for readability
 export const ok = E.right
 export const err = E.left
