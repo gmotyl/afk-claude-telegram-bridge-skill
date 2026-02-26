@@ -152,7 +152,10 @@ def cleanup_stale_slots(state, preserve_ipc_dirs=False, verbose=False):
     Returns: List of (slot_num, session_id, reason) tuples for cleaned slots
     """
     cleaned = []
-    slots = state.get("slots", {})
+    # Ensure slots dict exists in state
+    if "slots" not in state:
+        state["slots"] = {}
+    slots = state["slots"]
 
     for slot_num in list(slots.keys()):
         is_active, reason = is_slot_actually_active(state, slot_num)
