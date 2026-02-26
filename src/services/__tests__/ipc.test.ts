@@ -1,0 +1,452 @@
+/**
+ * @module services/ipc.test
+ * Tests for IPC (Inter-Process Communication) event queue module
+ * Tests JSONL file read/write operations using TaskEither for error handling
+ */
+
+import * as TE from 'fp-ts/TaskEither'
+import * as E from 'fp-ts/Either'
+import * as fs from 'fs/promises'
+import * as path from 'path'
+import * as os from 'os'
+import {
+  readEventQueue,
+  writeEvent,
+  deleteEventFile,
+  listEvents
+} from '../ipc'
+
+describe('IPC Event Queue Module', () => {
+  let tempDir: string
+
+  beforeEach(async () => {
+    // Create temporary directory for each test
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ipc-test-'))
+  })
+
+  afterEach(async () => {
+    // Clean up temporary directory after each test
+    try {
+      await fs.rm(tempDir, { recursive: true, force: true })
+    } catch {
+      // Ignore cleanup errors
+    }
+  })
+
+  describe('readEventQueue', () => {
+    it('reads empty JSONL file and returns empty array', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      await fs.writeFile(eventsFile, '', 'utf-8')
+
+      const result = await readEventQueue(eventsFile)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        const events = result.right as any[]
+        expect(events).toEqual([])
+      }
+    })
+
+    it('reads JSONL file with single event', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      const event = { _tag: 'Heartbeat', slotNum: 1 }
+      await fs.writeFile(eventsFile, JSON.stringify(event) + '\n', 'utf-8')
+
+      const result = await readEventQueue(eventsFile)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        const events = result.right as any[]
+        expect(events).toHaveLength(1)
+        expect(events[0]).toEqual(event)
+      }
+    })
+
+    it('reads JSONL file with multiple events', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      const events = [
+        { _tag: 'SessionStart', slotNum: 1, projectName: 'metro' },
+        { _tag: 'Heartbeat', slotNum: 1 },
+        { _tag: 'Message', text: 'Hello', slotNum: 1 },
+        { _tag: 'SessionEnd', slotNum: 1 }
+      ]
+      const content = events.map(e => JSON.stringify(e)).join('\n') + '\n'
+      await fs.writeFile(eventsFile, content, 'utf-8')
+
+      const result = await readEventQueue(eventsFile)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        const parsedEvents = result.right as any[]
+        expect(parsedEvents).toHaveLength(4)
+        expect(parsedEvents).toEqual(events)
+      }
+    })
+
+    it('returns Left error for missing file', async () => {
+      const eventsFile = path.join(tempDir, 'nonexistent.jsonl')
+
+      const result = await readEventQueue(eventsFile)()
+
+      expect(E.isLeft(result)).toBe(true)
+      if (E.isLeft(result)) {
+        const error = result.left as Error
+        expect(error).toBeInstanceOf(Error)
+        expect(error.message).toContain('ENOENT')
+      }
+    })
+
+    it('returns Left error for invalid JSON on a line', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      const content = '{"_tag":"Heartbeat","slotNum":1}\ninvalid json\n'
+      await fs.writeFile(eventsFile, content, 'utf-8')
+
+      const result = await readEventQueue(eventsFile)()
+
+      expect(E.isLeft(result)).toBe(true)
+      if (E.isLeft(result)) {
+        const error = result.left as Error
+        expect(error).toBeInstanceOf(Error)
+      }
+    })
+
+    it('skips empty lines in JSONL file', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      const events = [
+        { _tag: 'Heartbeat', slotNum: 1 },
+        { _tag: 'Heartbeat', slotNum: 2 }
+      ]
+      const content = `${JSON.stringify(events[0])}\n\n${JSON.stringify(events[1])}\n`
+      await fs.writeFile(eventsFile, content, 'utf-8')
+
+      const result = await readEventQueue(eventsFile)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        const parsedEvents = result.right as any[]
+        expect(parsedEvents).toHaveLength(2)
+        expect(parsedEvents).toEqual(events)
+      }
+    })
+
+    it('handles trailing newlines correctly', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      const event = { _tag: 'Message', text: 'Test', slotNum: 1 }
+      // Multiple trailing newlines
+      await fs.writeFile(
+        eventsFile,
+        JSON.stringify(event) + '\n\n\n',
+        'utf-8'
+      )
+
+      const result = await readEventQueue(eventsFile)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        const parsedEvents = result.right as any[]
+        expect(parsedEvents).toHaveLength(1)
+        expect(parsedEvents[0]).toEqual(event)
+      }
+    })
+
+    it('returns TaskEither that is lazy (async)', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      await fs.writeFile(eventsFile, '', 'utf-8')
+
+      const task = readEventQueue(eventsFile)
+      expect(typeof task).toBe('function')
+
+      const result = await task()
+      expect(E.isRight(result)).toBe(true)
+    })
+
+    it('handles permission denied error', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      await fs.writeFile(eventsFile, '', 'utf-8')
+      await fs.chmod(eventsFile, 0o000)
+
+      const result = await readEventQueue(eventsFile)()
+
+      expect(E.isLeft(result)).toBe(true)
+
+      // Cleanup - restore permissions to allow deletion
+      await fs.chmod(eventsFile, 0o644)
+    })
+
+    it('parses complex event objects correctly', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      const complexEvent = {
+        _tag: 'Message',
+        text: 'Multi\nline\ntext with "quotes"',
+        slotNum: 42,
+        timestamp: 1708851000,
+        metadata: { nested: true }
+      }
+      await fs.writeFile(eventsFile, JSON.stringify(complexEvent) + '\n', 'utf-8')
+
+      const result = await readEventQueue(eventsFile)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        const parsedEvents = result.right as any[]
+        expect(parsedEvents[0]).toEqual(complexEvent)
+      }
+    })
+  })
+
+  describe('writeEvent', () => {
+    it('appends event to empty file', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      await fs.writeFile(eventsFile, '', 'utf-8')
+      const event = { _tag: 'Heartbeat', slotNum: 1 }
+
+      const result = await writeEvent(eventsFile, event)()
+
+      expect(E.isRight(result)).toBe(true)
+      const content = await fs.readFile(eventsFile, 'utf-8')
+      expect(content).toBe(JSON.stringify(event) + '\n')
+    })
+
+    it('appends event to file with existing events', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      const event1 = { _tag: 'SessionStart', slotNum: 1, projectName: 'metro' }
+      const event2 = { _tag: 'Heartbeat', slotNum: 1 }
+
+      await fs.writeFile(eventsFile, JSON.stringify(event1) + '\n', 'utf-8')
+      const result = await writeEvent(eventsFile, event2)()
+
+      expect(E.isRight(result)).toBe(true)
+      const content = await fs.readFile(eventsFile, 'utf-8')
+      const lines = content.split('\n').filter(line => line.length > 0)
+      expect(lines).toHaveLength(2)
+      expect(JSON.parse(lines[0] as string)).toEqual(event1)
+      expect(JSON.parse(lines[1] as string)).toEqual(event2)
+    })
+
+    it('creates file if it does not exist', async () => {
+      const eventsFile = path.join(tempDir, 'new-events.jsonl')
+      const event = { _tag: 'Message', text: 'New', slotNum: 1 }
+
+      const result = await writeEvent(eventsFile, event)()
+
+      expect(E.isRight(result)).toBe(true)
+      const content = await fs.readFile(eventsFile, 'utf-8')
+      expect(content).toBe(JSON.stringify(event) + '\n')
+    })
+
+    it('returns Left error for invalid directory path', async () => {
+      const eventsFile = path.join(tempDir, 'nonexistent-dir', 'events.jsonl')
+      const event = { _tag: 'Heartbeat', slotNum: 1 }
+
+      const result = await writeEvent(eventsFile, event)()
+
+      expect(E.isLeft(result)).toBe(true)
+      if (E.isLeft(result)) {
+        const error = result.left as Error
+        expect(error).toBeInstanceOf(Error)
+      }
+    })
+
+    it('returns TaskEither that is lazy (async)', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      const event = { _tag: 'Heartbeat', slotNum: 1 }
+
+      const task = writeEvent(eventsFile, event)
+      expect(typeof task).toBe('function')
+
+      const result = await task()
+      expect(E.isRight(result)).toBe(true)
+    })
+
+    it('handles complex event objects', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      const complexEvent = {
+        _tag: 'Message',
+        text: 'Complex "quoted" text',
+        slotNum: 99,
+        nested: { data: [1, 2, 3] }
+      }
+
+      const result = await writeEvent(eventsFile, complexEvent)()
+
+      expect(E.isRight(result)).toBe(true)
+      const content = await fs.readFile(eventsFile, 'utf-8')
+      const parsed = JSON.parse(content.trim())
+      expect(parsed).toEqual(complexEvent)
+    })
+
+    it('handles permission denied error', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      await fs.writeFile(eventsFile, '', 'utf-8')
+      await fs.chmod(tempDir, 0o000)
+
+      const event = { _tag: 'Heartbeat', slotNum: 1 }
+      const result = await writeEvent(eventsFile, event)()
+
+      expect(E.isLeft(result)).toBe(true)
+
+      // Cleanup - restore permissions
+      await fs.chmod(tempDir, 0o755)
+    })
+  })
+
+  describe('deleteEventFile', () => {
+    it('deletes an existing event file', async () => {
+      const eventFile = path.join(tempDir, 'event.jsonl')
+      await fs.writeFile(eventFile, '{}', 'utf-8')
+
+      const result = await deleteEventFile(eventFile)()
+
+      expect(E.isRight(result)).toBe(true)
+      const exists = await fs
+        .access(eventFile)
+        .then(() => true)
+        .catch(() => false)
+      expect(exists).toBe(false)
+    })
+
+    it('returns Left error for nonexistent file', async () => {
+      const eventFile = path.join(tempDir, 'nonexistent.jsonl')
+
+      const result = await deleteEventFile(eventFile)()
+
+      expect(E.isLeft(result)).toBe(true)
+      if (E.isLeft(result)) {
+        const error = result.left as Error
+        expect(error).toBeInstanceOf(Error)
+      }
+    })
+
+    it('returns TaskEither that is lazy (async)', async () => {
+      const eventFile = path.join(tempDir, 'event.jsonl')
+      await fs.writeFile(eventFile, '{}', 'utf-8')
+
+      const task = deleteEventFile(eventFile)
+      expect(typeof task).toBe('function')
+
+      const result = await task()
+      expect(E.isRight(result)).toBe(true)
+    })
+
+    it('handles permission denied error', async () => {
+      const eventFile = path.join(tempDir, 'event.jsonl')
+      await fs.writeFile(eventFile, '{}', 'utf-8')
+      await fs.chmod(tempDir, 0o000)
+
+      const result = await deleteEventFile(eventFile)()
+
+      expect(E.isLeft(result)).toBe(true)
+
+      // Cleanup - restore permissions
+      await fs.chmod(tempDir, 0o755)
+    })
+  })
+
+  describe('listEvents', () => {
+    it('returns empty array for empty directory', async () => {
+      const result = await listEvents(tempDir)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        const files = result.right as string[]
+        expect(files).toEqual([])
+      }
+    })
+
+    it('lists all files in directory', async () => {
+      const file1 = path.join(tempDir, 'event1.jsonl')
+      const file2 = path.join(tempDir, 'event2.jsonl')
+      const file3 = path.join(tempDir, 'event3.jsonl')
+
+      await fs.writeFile(file1, '{}', 'utf-8')
+      await fs.writeFile(file2, '{}', 'utf-8')
+      await fs.writeFile(file3, '{}', 'utf-8')
+
+      const result = await listEvents(tempDir)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        const files = result.right as string[]
+        expect(files).toHaveLength(3)
+        expect(files).toContain('event1.jsonl')
+        expect(files).toContain('event2.jsonl')
+        expect(files).toContain('event3.jsonl')
+      }
+    })
+
+    it('lists files with various extensions', async () => {
+      await fs.writeFile(path.join(tempDir, 'file1.jsonl'), '{}', 'utf-8')
+      await fs.writeFile(path.join(tempDir, 'file2.json'), '{}', 'utf-8')
+      await fs.writeFile(path.join(tempDir, 'file3.txt'), 'text', 'utf-8')
+
+      const result = await listEvents(tempDir)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        const files = result.right as string[]
+        expect(files).toHaveLength(3)
+      }
+    })
+
+    it('returns Left error for nonexistent directory', async () => {
+      const nonexistentDir = path.join(tempDir, 'nonexistent')
+
+      const result = await listEvents(nonexistentDir)()
+
+      expect(E.isLeft(result)).toBe(true)
+      if (E.isLeft(result)) {
+        const error = result.left as Error
+        expect(error).toBeInstanceOf(Error)
+      }
+    })
+
+    it('returns TaskEither that is lazy (async)', async () => {
+      const task = listEvents(tempDir)
+      expect(typeof task).toBe('function')
+
+      const result = await task()
+      expect(E.isRight(result)).toBe(true)
+    })
+
+    it('excludes subdirectories, only lists files', async () => {
+      await fs.writeFile(path.join(tempDir, 'file1.jsonl'), '{}', 'utf-8')
+      await fs.mkdir(path.join(tempDir, 'subdir'), { recursive: true })
+      await fs.writeFile(path.join(tempDir, 'subdir', 'file2.jsonl'), '{}', 'utf-8')
+
+      const result = await listEvents(tempDir)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        const files = result.right as string[]
+        expect(files).toHaveLength(1)
+        expect(files[0]).toBe('file1.jsonl')
+      }
+    })
+
+    it('handles permission denied error', async () => {
+      await fs.chmod(tempDir, 0o000)
+
+      const result = await listEvents(tempDir)()
+
+      expect(E.isLeft(result)).toBe(true)
+
+      // Cleanup - restore permissions
+      await fs.chmod(tempDir, 0o755)
+    })
+
+    it('returns sorted file list', async () => {
+      // Create files in non-alphabetical order
+      await fs.writeFile(path.join(tempDir, 'z.jsonl'), '{}', 'utf-8')
+      await fs.writeFile(path.join(tempDir, 'a.jsonl'), '{}', 'utf-8')
+      await fs.writeFile(path.join(tempDir, 'm.jsonl'), '{}', 'utf-8')
+
+      const result = await listEvents(tempDir)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        const files = result.right as string[]
+        expect(files).toEqual(['a.jsonl', 'm.jsonl', 'z.jsonl'])
+      }
+    })
+  })
+})
