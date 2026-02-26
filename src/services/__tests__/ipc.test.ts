@@ -15,6 +15,12 @@ import {
   deleteEventFile,
   listEvents
 } from '../ipc'
+import {
+  sessionStart,
+  heartbeat,
+  message,
+  sessionEnd
+} from '../../types/events'
 
 describe('IPC Event Queue Module', () => {
   let tempDir: string
@@ -49,14 +55,14 @@ describe('IPC Event Queue Module', () => {
 
     it('reads JSONL file with single event', async () => {
       const eventsFile = path.join(tempDir, 'events.jsonl')
-      const event = { _tag: 'Heartbeat', slotNum: 1 }
+      const event = heartbeat(1)
       await fs.writeFile(eventsFile, JSON.stringify(event) + '\n', 'utf-8')
 
       const result = await readEventQueue(eventsFile)()
 
       expect(E.isRight(result)).toBe(true)
       if (E.isRight(result)) {
-        const events = result.right as any[]
+        const events = result.right
         expect(events).toHaveLength(1)
         expect(events[0]).toEqual(event)
       }
@@ -65,10 +71,10 @@ describe('IPC Event Queue Module', () => {
     it('reads JSONL file with multiple events', async () => {
       const eventsFile = path.join(tempDir, 'events.jsonl')
       const events = [
-        { _tag: 'SessionStart', slotNum: 1, projectName: 'metro' },
-        { _tag: 'Heartbeat', slotNum: 1 },
-        { _tag: 'Message', text: 'Hello', slotNum: 1 },
-        { _tag: 'SessionEnd', slotNum: 1 }
+        sessionStart(1, 'metro'),
+        heartbeat(1),
+        message('Hello', 1),
+        sessionEnd(1)
       ]
       const content = events.map(e => JSON.stringify(e)).join('\n') + '\n'
       await fs.writeFile(eventsFile, content, 'utf-8')
@@ -77,7 +83,7 @@ describe('IPC Event Queue Module', () => {
 
       expect(E.isRight(result)).toBe(true)
       if (E.isRight(result)) {
-        const parsedEvents = result.right as any[]
+        const parsedEvents = result.right
         expect(parsedEvents).toHaveLength(4)
         expect(parsedEvents).toEqual(events)
       }
@@ -90,9 +96,8 @@ describe('IPC Event Queue Module', () => {
 
       expect(E.isLeft(result)).toBe(true)
       if (E.isLeft(result)) {
-        const error = result.left as Error
-        expect(error).toBeInstanceOf(Error)
-        expect(error.message).toContain('ENOENT')
+        const error = result.left
+        expect(error._tag).toBe('IpcReadError')
       }
     })
 
@@ -105,16 +110,16 @@ describe('IPC Event Queue Module', () => {
 
       expect(E.isLeft(result)).toBe(true)
       if (E.isLeft(result)) {
-        const error = result.left as Error
-        expect(error).toBeInstanceOf(Error)
+        const error = result.left
+        expect(error._tag).toBe('IpcParseError')
       }
     })
 
     it('skips empty lines in JSONL file', async () => {
       const eventsFile = path.join(tempDir, 'events.jsonl')
       const events = [
-        { _tag: 'Heartbeat', slotNum: 1 },
-        { _tag: 'Heartbeat', slotNum: 2 }
+        heartbeat(1),
+        heartbeat(2)
       ]
       const content = `${JSON.stringify(events[0])}\n\n${JSON.stringify(events[1])}\n`
       await fs.writeFile(eventsFile, content, 'utf-8')
@@ -123,7 +128,7 @@ describe('IPC Event Queue Module', () => {
 
       expect(E.isRight(result)).toBe(true)
       if (E.isRight(result)) {
-        const parsedEvents = result.right as any[]
+        const parsedEvents = result.right
         expect(parsedEvents).toHaveLength(2)
         expect(parsedEvents).toEqual(events)
       }
@@ -131,7 +136,7 @@ describe('IPC Event Queue Module', () => {
 
     it('handles trailing newlines correctly', async () => {
       const eventsFile = path.join(tempDir, 'events.jsonl')
-      const event = { _tag: 'Message', text: 'Test', slotNum: 1 }
+      const event = message('Test', 1)
       // Multiple trailing newlines
       await fs.writeFile(
         eventsFile,
@@ -143,7 +148,7 @@ describe('IPC Event Queue Module', () => {
 
       expect(E.isRight(result)).toBe(true)
       if (E.isRight(result)) {
-        const parsedEvents = result.right as any[]
+        const parsedEvents = result.right
         expect(parsedEvents).toHaveLength(1)
         expect(parsedEvents[0]).toEqual(event)
       }
@@ -168,6 +173,10 @@ describe('IPC Event Queue Module', () => {
       const result = await readEventQueue(eventsFile)()
 
       expect(E.isLeft(result)).toBe(true)
+      if (E.isLeft(result)) {
+        const error = result.left
+        expect(error._tag).toBe('IpcReadError')
+      }
 
       // Cleanup - restore permissions to allow deletion
       await fs.chmod(eventsFile, 0o644)
@@ -175,20 +184,14 @@ describe('IPC Event Queue Module', () => {
 
     it('parses complex event objects correctly', async () => {
       const eventsFile = path.join(tempDir, 'events.jsonl')
-      const complexEvent = {
-        _tag: 'Message',
-        text: 'Multi\nline\ntext with "quotes"',
-        slotNum: 42,
-        timestamp: 1708851000,
-        metadata: { nested: true }
-      }
+      const complexEvent = message('Multi\nline\ntext with "quotes"', 42)
       await fs.writeFile(eventsFile, JSON.stringify(complexEvent) + '\n', 'utf-8')
 
       const result = await readEventQueue(eventsFile)()
 
       expect(E.isRight(result)).toBe(true)
       if (E.isRight(result)) {
-        const parsedEvents = result.right as any[]
+        const parsedEvents = result.right
         expect(parsedEvents[0]).toEqual(complexEvent)
       }
     })
@@ -198,7 +201,7 @@ describe('IPC Event Queue Module', () => {
     it('appends event to empty file', async () => {
       const eventsFile = path.join(tempDir, 'events.jsonl')
       await fs.writeFile(eventsFile, '', 'utf-8')
-      const event = { _tag: 'Heartbeat', slotNum: 1 }
+      const event = heartbeat(1)
 
       const result = await writeEvent(eventsFile, event)()
 
@@ -209,8 +212,8 @@ describe('IPC Event Queue Module', () => {
 
     it('appends event to file with existing events', async () => {
       const eventsFile = path.join(tempDir, 'events.jsonl')
-      const event1 = { _tag: 'SessionStart', slotNum: 1, projectName: 'metro' }
-      const event2 = { _tag: 'Heartbeat', slotNum: 1 }
+      const event1 = sessionStart(1, 'metro')
+      const event2 = heartbeat(1)
 
       await fs.writeFile(eventsFile, JSON.stringify(event1) + '\n', 'utf-8')
       const result = await writeEvent(eventsFile, event2)()
@@ -225,7 +228,7 @@ describe('IPC Event Queue Module', () => {
 
     it('creates file if it does not exist', async () => {
       const eventsFile = path.join(tempDir, 'new-events.jsonl')
-      const event = { _tag: 'Message', text: 'New', slotNum: 1 }
+      const event = message('New', 1)
 
       const result = await writeEvent(eventsFile, event)()
 
@@ -236,20 +239,20 @@ describe('IPC Event Queue Module', () => {
 
     it('returns Left error for invalid directory path', async () => {
       const eventsFile = path.join(tempDir, 'nonexistent-dir', 'events.jsonl')
-      const event = { _tag: 'Heartbeat', slotNum: 1 }
+      const event = heartbeat(1)
 
       const result = await writeEvent(eventsFile, event)()
 
       expect(E.isLeft(result)).toBe(true)
       if (E.isLeft(result)) {
-        const error = result.left as Error
-        expect(error).toBeInstanceOf(Error)
+        const error = result.left
+        expect(error._tag).toBe('IpcWriteError')
       }
     })
 
     it('returns TaskEither that is lazy (async)', async () => {
       const eventsFile = path.join(tempDir, 'events.jsonl')
-      const event = { _tag: 'Heartbeat', slotNum: 1 }
+      const event = heartbeat(1)
 
       const task = writeEvent(eventsFile, event)
       expect(typeof task).toBe('function')
@@ -260,12 +263,7 @@ describe('IPC Event Queue Module', () => {
 
     it('handles complex event objects', async () => {
       const eventsFile = path.join(tempDir, 'events.jsonl')
-      const complexEvent = {
-        _tag: 'Message',
-        text: 'Complex "quoted" text',
-        slotNum: 99,
-        nested: { data: [1, 2, 3] }
-      }
+      const complexEvent = message('Complex "quoted" text', 99)
 
       const result = await writeEvent(eventsFile, complexEvent)()
 
@@ -280,10 +278,14 @@ describe('IPC Event Queue Module', () => {
       await fs.writeFile(eventsFile, '', 'utf-8')
       await fs.chmod(tempDir, 0o000)
 
-      const event = { _tag: 'Heartbeat', slotNum: 1 }
+      const event = heartbeat(1)
       const result = await writeEvent(eventsFile, event)()
 
       expect(E.isLeft(result)).toBe(true)
+      if (E.isLeft(result)) {
+        const error = result.left
+        expect(error._tag).toBe('IpcWriteError')
+      }
 
       // Cleanup - restore permissions
       await fs.chmod(tempDir, 0o755)
@@ -312,8 +314,8 @@ describe('IPC Event Queue Module', () => {
 
       expect(E.isLeft(result)).toBe(true)
       if (E.isLeft(result)) {
-        const error = result.left as Error
-        expect(error).toBeInstanceOf(Error)
+        const error = result.left
+        expect(error._tag).toBe('IpcWriteError')
       }
     })
 
@@ -336,6 +338,10 @@ describe('IPC Event Queue Module', () => {
       const result = await deleteEventFile(eventFile)()
 
       expect(E.isLeft(result)).toBe(true)
+      if (E.isLeft(result)) {
+        const error = result.left
+        expect(error._tag).toBe('IpcWriteError')
+      }
 
       // Cleanup - restore permissions
       await fs.chmod(tempDir, 0o755)
@@ -395,8 +401,8 @@ describe('IPC Event Queue Module', () => {
 
       expect(E.isLeft(result)).toBe(true)
       if (E.isLeft(result)) {
-        const error = result.left as Error
-        expect(error).toBeInstanceOf(Error)
+        const error = result.left
+        expect(error._tag).toBe('IpcReadError')
       }
     })
 
@@ -429,6 +435,10 @@ describe('IPC Event Queue Module', () => {
       const result = await listEvents(tempDir)()
 
       expect(E.isLeft(result)).toBe(true)
+      if (E.isLeft(result)) {
+        const error = result.left
+        expect(error._tag).toBe('IpcReadError')
+      }
 
       // Cleanup - restore permissions
       await fs.chmod(tempDir, 0o755)

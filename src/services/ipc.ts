@@ -7,18 +7,46 @@
 
 import * as TE from 'fp-ts/TaskEither'
 import * as fs from 'fs/promises'
+import { type IpcEvent } from '../types/events'
+import {
+  type IpcError,
+  ipcReadError,
+  ipcWriteError,
+  ipcParseError
+} from '../types/errors'
 
 /**
- * Convert an unknown error to a standardized Error instance
- * @param error - Any thrown error (can be Error, string, or unknown type)
- * @returns Standardized Error instance
+ * Create error handler for read operations that distinguishes parse errors from file read errors
+ * @param path - Path to the file being read
+ * @returns Error handler function that returns properly typed IpcError
  */
-const convertError = (error: unknown): Error => {
-  if (error instanceof Error) {
-    return error
+const readErrorHandler = (path: string) => (error: unknown): IpcError => {
+  // If already an IpcError (from internal throw), return as-is
+  if (typeof error === 'object' && error !== null && '_tag' in error) {
+    const possibleError = error as { _tag?: string }
+    if (
+      possibleError._tag === 'IpcParseError' ||
+      possibleError._tag === 'IpcReadError' ||
+      possibleError._tag === 'IpcWriteError'
+    ) {
+      return error as IpcError
+    }
   }
-  return new Error(String(error))
+
+  // Otherwise, check if it's a JSON parse error
+  if (error instanceof SyntaxError || (error instanceof Error && error.message.includes('JSON'))) {
+    return ipcParseError(path, '', error)
+  }
+  return ipcReadError(path, error)
 }
+
+/**
+ * Create error handler for write operations
+ * @param path - Path to the file being written
+ * @returns Error handler function that returns properly typed IpcError
+ */
+const writeErrorHandler = (path: string) => (error: unknown): IpcError =>
+  ipcWriteError(path, error)
 
 /**
  * Read all events from a JSONL file.
@@ -31,16 +59,20 @@ const convertError = (error: unknown): Error => {
  * 3. Filter empty lines
  * 4. Parse each line as JSON
  *
+ * Distinguishes between read errors and parse errors:
+ * - Parse errors: JSON.parse failures → IpcParseError
+ * - Read errors: File system failures → IpcReadError
+ *
  * @param eventsFile - Path to the JSONL events file
- * @returns TaskEither<Error, any[]> - Left(error) or Right(array of parsed events)
+ * @returns TaskEither<IpcError, IpcEvent[]> - Left(error) or Right(array of typed events)
  *
  * @example
  * const result = await readEventQueue('/tmp/ipc/events.jsonl')()
  * if (E.isRight(result)) {
- *   console.log(result.right) // array of events
+ *   console.log(result.right) // array of IpcEvent objects
  * }
  */
-export const readEventQueue = (eventsFile: string): TE.TaskEither<Error, any[]> => {
+export const readEventQueue = (eventsFile: string): TE.TaskEither<IpcError, IpcEvent[]> => {
   return TE.tryCatch(
     async () => {
       // Read file as UTF-8 text
@@ -49,12 +81,16 @@ export const readEventQueue = (eventsFile: string): TE.TaskEither<Error, any[]> 
       // Split by newlines and filter empty lines
       const lines = content.split('\n').filter(line => line.trim().length > 0)
 
-      // Parse each line as JSON
-      const events = lines.map(line => JSON.parse(line))
-
-      return events
+      // Parse each line as JSON - wrap in try-catch to distinguish parse errors
+      try {
+        const events: IpcEvent[] = lines.map(line => JSON.parse(line) as IpcEvent)
+        return events
+      } catch (parseError) {
+        // Convert parse error to proper type for throw to be caught by TE.tryCatch
+        throw ipcParseError(eventsFile, '', parseError)
+      }
     },
-    convertError
+    readErrorHandler(eventsFile)
   )
 }
 
@@ -64,11 +100,11 @@ export const readEventQueue = (eventsFile: string): TE.TaskEither<Error, any[]> 
  * Appends the event as a JSON line (with newline terminator).
  *
  * @param eventsFile - Path to the JSONL events file
- * @param event - Event object to write (any serializable value)
- * @returns TaskEither<Error, void> - Left(error) or Right(void)
+ * @param event - Typed IpcEvent object to write
+ * @returns TaskEither<IpcError, void> - Left(error) or Right(void)
  *
  * @example
- * const event = { _tag: 'Heartbeat', slotNum: 1 }
+ * const event = heartbeat(1)
  * const result = await writeEvent('/tmp/ipc/events.jsonl', event)()
  * if (E.isRight(result)) {
  *   console.log('Event written')
@@ -76,8 +112,8 @@ export const readEventQueue = (eventsFile: string): TE.TaskEither<Error, any[]> 
  */
 export const writeEvent = (
   eventsFile: string,
-  event: any
-): TE.TaskEither<Error, void> => {
+  event: IpcEvent
+): TE.TaskEither<IpcError, void> => {
   return TE.tryCatch(
     async () => {
       // Serialize event to JSON and add newline
@@ -86,7 +122,7 @@ export const writeEvent = (
       // Append to file (creates if doesn't exist)
       await fs.appendFile(eventsFile, line, 'utf-8')
     },
-    convertError
+    writeErrorHandler(eventsFile)
   )
 }
 
@@ -95,7 +131,7 @@ export const writeEvent = (
  * Returns error if file doesn't exist or permission denied.
  *
  * @param eventFile - Path to the event file to delete
- * @returns TaskEither<Error, void> - Left(error) or Right(void)
+ * @returns TaskEither<IpcError, void> - Left(error) or Right(void)
  *
  * @example
  * const result = await deleteEventFile('/tmp/ipc/event-S1.jsonl')()
@@ -103,12 +139,12 @@ export const writeEvent = (
  *   console.log('File deleted')
  * }
  */
-export const deleteEventFile = (eventFile: string): TE.TaskEither<Error, void> => {
+export const deleteEventFile = (eventFile: string): TE.TaskEither<IpcError, void> => {
   return TE.tryCatch(
     async () => {
       await fs.unlink(eventFile)
     },
-    convertError
+    writeErrorHandler(eventFile)
   )
 }
 
@@ -118,7 +154,7 @@ export const deleteEventFile = (eventFile: string): TE.TaskEither<Error, void> =
  * Includes only files, excludes subdirectories.
  *
  * @param eventsDir - Path to the IPC directory
- * @returns TaskEither<Error, string[]> - Left(error) or Right(sorted filename array)
+ * @returns TaskEither<IpcError, string[]> - Left(error) or Right(sorted filename array)
  *
  * @example
  * const result = await listEvents('/tmp/ipc/')()
@@ -126,7 +162,7 @@ export const deleteEventFile = (eventFile: string): TE.TaskEither<Error, void> =
  *   console.log(result.right) // ['event-S1.jsonl', 'event-S2.jsonl']
  * }
  */
-export const listEvents = (eventsDir: string): TE.TaskEither<Error, string[]> => {
+export const listEvents = (eventsDir: string): TE.TaskEither<IpcError, string[]> => {
   return TE.tryCatch(
     async () => {
       // Read directory contents
@@ -140,6 +176,6 @@ export const listEvents = (eventsDir: string): TE.TaskEither<Error, string[]> =>
 
       return files
     },
-    convertError
+    readErrorHandler(eventsDir)
   )
 }
