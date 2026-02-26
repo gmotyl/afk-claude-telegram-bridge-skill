@@ -484,9 +484,31 @@ def cmd_activate(session_id, project, topic_name=""):
         for slot_num, info in slots.items():
             if (info.get("project") == (project or "unknown")
                     and info.get("topic_name") == (topic_name or f"S{slot_num} - {project or 'unknown'}")):
-                print(f"⚠️  Duplicate detected: project '{project}' already active in slot S{slot_num}")
-                print(f"   Run /back first, then /afk again.")
-                sys.exit(1)
+                # Found duplicate - check if it's truly active or stale
+                dup_session_id = info.get("session_id")
+                is_active, _ = is_slot_actually_active(state, slot_num)
+
+                if is_active and dup_session_id == session_id:
+                    # Same session already active - just return slot number
+                    print(f"Session already active in slot S{slot_num}")
+                    return slot_num
+                elif is_active:
+                    # Different session but same project - auto-deactivate old session
+                    log.info(f"[ACTIVATE] Auto-deactivating old session {dup_session_id[:8]} for new {session_id[:8]}")
+                    del slots[slot_num]
+                    # Clean up IPC for old session
+                    old_ipc = os.path.join(IPC_DIR, dup_session_id)
+                    if os.path.isdir(old_ipc):
+                        try:
+                            shutil.rmtree(old_ipc)
+                        except:
+                            pass
+                    break  # Continue with new activation
+                else:
+                    # Stale duplicate - clean it up
+                    log.info(f"[ACTIVATE] Cleaning stale duplicate S{slot_num}")
+                    del slots[slot_num]
+                    break  # Continue with new activation
         # Find next available slot
         assigned_slot = None
         for i in range(1, max_slots + 1):
