@@ -67,6 +67,13 @@ const processEvent = (
       // In a real implementation, this would send to Telegram
       return E.right(state)
     }
+
+    case 'PermissionRequest': {
+      // Permission requests are handled by the hook/daemon approval flow
+      // The daemon responds via response files, not by modifying state
+      // Just return state unchanged
+      return E.right(state)
+    }
   }
 }
 

@@ -108,7 +108,12 @@ export type HookParseError = {
   readonly message: string
 }
 
-export type BusinessError = StateError | ValidationError | SlotError | HookParseError
+export type HookError = {
+  readonly _tag: 'HookError'
+  readonly message: string
+}
+
+export type BusinessError = StateError | ValidationError | SlotError | HookParseError | HookError
 
 export const stateError = (message: string, details?: unknown): StateError => ({
   _tag: 'StateError',
@@ -130,6 +135,11 @@ export const slotError = (slotNum: string, message: string): SlotError => ({
 
 export const hookParseError = (message: string): HookParseError => ({
   _tag: 'HookParseError',
+  message,
+})
+
+export const hookError = (message: string): HookError => ({
+  _tag: 'HookError',
   message,
 })
 
@@ -163,6 +173,8 @@ export const errorMessage = (error: BridgeError): string => {
       return `Slot ${error.slotNum} error: ${error.message}`
     case 'HookParseError':
       return `Hook parse error: ${error.message}`
+    case 'HookError':
+      return `Hook error: ${error.message}`
   }
 }
 
@@ -184,5 +196,7 @@ export const errorStatusCode = (error: BridgeError): number => {
       return 400
     case 'HookParseError':
       return 400
+    case 'HookError':
+      return 500
   }
 }
