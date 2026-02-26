@@ -493,10 +493,13 @@ class BridgeDaemon:
                 log.debug(f"[KEEPALIVE] Session {session_id[:8]} alive, next ping in {int(idle_ping_seconds - (now - last_ping))}s")
 
     def _handle_update(self, update):
+        log.debug("[UPDATE] Received: %s", json.dumps(update)[:200])
         if "callback_query" in update:
             self._handle_callback(update["callback_query"])
         elif "message" in update:
             self._handle_message(update["message"])
+        else:
+            log.debug("[UPDATE] Ignored update (no message or callback)")
 
     def _handle_callback(self, cq):
         data = cq.get("data", "")
@@ -703,7 +706,11 @@ class BridgeDaemon:
         # Extract topic thread ID from message
         msg_thread_id = msg.get("message_thread_id")
 
+        log.info("[MSG] chat_id=%s (expected=%s) thread=%s text=%s",
+                 chat_id, self.tg.chat_id, msg_thread_id, text[:100])
+
         if chat_id != self.tg.chat_id or not text:
+            log.info("[MSG] Dropped: chat_id_match=%s has_text=%s", chat_id == self.tg.chat_id, bool(text))
             return
 
         # Strip @botname suffix from commands (Telegram adds it in groups)
