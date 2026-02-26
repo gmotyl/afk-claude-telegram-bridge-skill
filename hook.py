@@ -473,6 +473,18 @@ def cmd_activate(session_id, project, topic_name=""):
                 log.info(f"[ACTIVATE] Cleaned stale slot S{slot_num} "
                         f"(session: {sid[:8]}..., reason: {reason})")
 
+        # Clean up orphaned IPC directories (dirs with no matching slot in state)
+        active_session_ids = {info.get("session_id") for info in slots.values()}
+        if os.path.isdir(IPC_DIR):
+            for dirname in os.listdir(IPC_DIR):
+                dirpath = os.path.join(IPC_DIR, dirname)
+                if os.path.isdir(dirpath) and dirname not in active_session_ids:
+                    try:
+                        shutil.rmtree(dirpath)
+                        log.info(f"[ACTIVATE] Removed orphaned IPC dir: {dirname[:12]}...")
+                    except Exception as e:
+                        log.warning(f"[ACTIVATE] Failed to remove orphaned IPC dir {dirname}: {e}")
+
         # Check if already active
         for slot_num, info in slots.items():
             if info.get("session_id") == session_id:
@@ -656,6 +668,12 @@ def cmd_deactivate(session_id):
         # Stop daemon if no sessions remain
         if not slots:
             stop_daemon(state)
+            # Clean ALL remaining IPC dirs when last session deactivated
+            if os.path.isdir(IPC_DIR):
+                for dirname in os.listdir(IPC_DIR):
+                    dirpath = os.path.join(IPC_DIR, dirname)
+                    if os.path.isdir(dirpath):
+                        shutil.rmtree(dirpath, ignore_errors=True)
 
         print(f"AFK mode deactivated — slot S{removed_slot} released.")
 
@@ -1073,9 +1091,6 @@ def _poll_response(ipc_dir, event_id, timeout):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Always check for pending Telegram instructions first (active listening)
-    check_pending_telegram_instructions()
-
     if len(sys.argv) < 2:
         print("Usage: hook.py <activate|deactivate|status|setup|respond|hook>", file=sys.stderr)
         sys.exit(1)

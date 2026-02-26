@@ -64,22 +64,34 @@ esac
 # --- Hook mode: read stdin JSON, delegate to hook.py for processing ---
 INPUT=$(cat)
 
+# GATE: state.json is the single source of truth for active AFK sessions.
+# IPC directories can be orphaned/stale — never use them alone to decide routing.
+ACTIVE_SLOTS=$(python3 -c "
+import json, os
+sf = '$STATE'
+if not os.path.isfile(sf):
+    print('0')
+else:
+    with open(sf) as f:
+        print(len(json.load(f).get('slots', {})))
+" 2>/dev/null)
+
+if [ "${ACTIVE_SLOTS:-0}" = "0" ]; then
+  exit 0
+fi
+
 # Extract session_id and hook event name
 SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
-HOOK_EVENT=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hook_event_name',''))" 2>/dev/null)
 
 if [ -z "$SESSION_ID" ]; then
-  echo "DEBUG: No session_id in hook input" >> "$BRIDGE_DIR/hook-debug.log"
   exit 0
 fi
 
 # Check if this session should be routed to AFK
 if [ -d "$BRIDGE_DIR/ipc/$SESSION_ID" ]; then
   # Direct match — this session IS the AFK session
-  echo "DEBUG: Hook triggered for session $SESSION_ID (event: $HOOK_EVENT)" >> "$BRIDGE_DIR/hook-debug.log"
+  :
 elif [ -z "$(ls "$BRIDGE_DIR/ipc" 2>/dev/null)" ]; then
-  # No AFK sessions at all — fast exit
-  echo "DEBUG: No AFK sessions active" >> "$BRIDGE_DIR/hook-debug.log"
   exit 0
 else
   # Check if session is bound or if there's exactly one unbound slot to bind to
@@ -101,10 +113,8 @@ unbound = [d for d in os.listdir(ipc)
 sys.exit(0 if len(unbound) == 1 else 1)
 " 2>/dev/null
   if [ $? -ne 0 ]; then
-    echo "DEBUG: Session $SESSION_ID not bound to any AFK slot — skipping" >> "$BRIDGE_DIR/hook-debug.log"
     exit 0
   fi
-  echo "DEBUG: Session $SESSION_ID bound or binding (event: $HOOK_EVENT)" >> "$BRIDGE_DIR/hook-debug.log"
 fi
 
 # Delegate to hook.py — handles binding and event processing
