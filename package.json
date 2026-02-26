@@ -1,0 +1,24 @@
+{
+  "name": "afk-claude-telegram-bridge",
+  "version": "2.0.0",
+  "description": "Remote-control Claude Code from Telegram when AFK",
+  "bin": {
+    "afk-claude-telegram-bridge": "dist/hook.js"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "typecheck": "tsc --noEmit",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.20.0",
+    "husky": "^9.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.4.0"
+  }
+}
