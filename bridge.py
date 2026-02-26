@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 telegram-bridge bridge.py — Telegram long-polling daemon.
-Wersja z obsługą Telegram Topics (Wątków) oraz Kolejkowaniem Wiadomości (Message Buffer).
+Supports Telegram Topics and Message Buffer for queuing instructions.
 """
 import json
 import logging
@@ -9,6 +9,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -67,12 +68,14 @@ class TelegramAPI:
             "commands": [
                 {"command": "compact", "description": "Compress conversation context"},
                 {"command": "clear", "description": "Clear conversation history"},
+                {"command": "ping", "description": "Check if agent is alive"},
+                {"command": "end", "description": "End AFK session from Telegram"},
             ]
         }
         return self._request("setMyCommands", data)
 
     def create_forum_topic(self, name):
-        """Tworzy nowy wątek (Topic) w Grupie Telegrama"""
+        """Create a new forum topic in the Telegram group"""
         data = {
             "chat_id": self.chat_id,
             "name": name
@@ -80,7 +83,7 @@ class TelegramAPI:
         return self._request("createForumTopic", data)
 
     def delete_forum_topic(self, thread_id):
-        """Usuwa wątek (Topic) z Grupy Telegrama"""
+        """Delete a forum topic from the Telegram group"""
         data = {
             "chat_id": self.chat_id,
             "message_thread_id": thread_id
@@ -123,6 +126,16 @@ class TelegramAPI:
         if text:
             data["text"] = text
         return self._request("answerCallbackQuery", data)
+
+    def send_chat_action(self, action="typing", thread_id=None):
+        """Send chat action (typing indicator) to a topic."""
+        data = {
+            "chat_id": self.chat_id,
+            "action": action,
+        }
+        if thread_id:
+            data["message_thread_id"] = thread_id
+        return self._request("sendChatAction", data)
 
     def get_updates(self, timeout=POLL_TIMEOUT):
         data = {
@@ -214,9 +227,9 @@ def permission_keyboard(event_id):
     ]}
 
 
-def stop_keyboard(event_id):
+def stop_keyboard(event_id, session_id):
     return {"inline_keyboard": [
-        [{"text": "🛑 Let it stop", "callback_data": f"stop:{event_id}"}]
+        [{"text": "🔚 End AFK Session", "callback_data": f"end_session:{session_id}"}],
     ]}
 
 
@@ -229,13 +242,21 @@ class BridgeDaemon:
         self.running = True
         self.event_positions = {}
         self.pending_events = {}
-        # Pamięć: session_id -> message_thread_id (Topic ID)
+        # Map: session_id -> message_thread_id (Topic ID)
         self.session_threads = {}
         # Idle ping tracking: session_id -> last_ping_timestamp
         self.last_idle_ping = {}
         # Context management: session_id -> interaction count
         self.interaction_counts = {}
         self.context_warning_sent = {}  # session_id -> threshold at which warning was sent
+        # Typing indicator: session_id -> True when Claude is processing
+        self.typing_sessions = {}
+        self.typing_last_sent = {}  # session_id -> timestamp of last typing action
+        # Permission batching: session_id -> {events: [...], timer_start: float}
+        self.permission_batch = {}
+        # Session trust: session_id -> True when user trusts all permissions
+        self.trusted_sessions = {}
+        self.approval_counts = {}  # session_id -> count of individual approvals
 
         signal.signal(signal.SIGTERM, self._handle_sigterm)
         signal.signal(signal.SIGINT, self._handle_sigterm)
@@ -260,6 +281,10 @@ class BridgeDaemon:
             if now - last_event_scan > EVENT_SCAN_INTERVAL:
                 self._scan_events()
                 last_event_scan = now
+
+            self._update_typing()
+            self._check_stale_events()
+            self._flush_permission_batches()
 
             try:
                 updates = self.tg.get_updates(timeout=2)
@@ -321,20 +346,80 @@ class BridgeDaemon:
         thread_id = self.session_threads.get(session_id)
         log.info(f"[EVENT] Processing {etype} (id={event_id}) for session {session_id[:8]}... thread={thread_id}")
 
+        # Stop typing when we hear back from Claude
+        if etype in ("stop", "permission_request", "response", "notification"):
+            self.typing_sessions[session_id] = False
+
         if etype == "activation":
             project = event.get("project", "Unknown")
             topic_name = event.get("topic_name", f"S{slot} - {project[:15]}")
-            log.info(f"[ACTIVATION] Creating topic '{topic_name}' for {project}")
-            res = self.tg.create_forum_topic(topic_name)
+            reuse_thread_id = event.get("reuse_thread_id")
 
-            if res and res.get("ok"):
-                thread_id = res["result"]["message_thread_id"]
-                self.session_threads[session_id] = thread_id
-                log.info(f"[ACTIVATION] Topic created: thread_id={thread_id}")
-            else:
-                log.error(f"[ACTIVATION] Failed to create topic: {res}")
+            if reuse_thread_id:
+                # Clean up old session state that was using this thread_id
+                old_session_id = None
+                for sid, t_id in list(self.session_threads.items()):
+                    if t_id == reuse_thread_id and sid != session_id:
+                        old_session_id = sid
+                        del self.session_threads[sid]
+                        log.info(f"[ACTIVATION] Removed old session mapping {sid[:8]} → thread {t_id}")
+                        break
 
-            self.tg.send_message(f"📡 <b>AFK Activated</b>\nProject: {escape_html(project)}", thread_id=thread_id)
+                # Clean up pending events from old session
+                if old_session_id:
+                    stale_events = [eid for eid, info in self.pending_events.items()
+                                    if info.get("session_id") == old_session_id]
+                    for eid in stale_events:
+                        del self.pending_events[eid]
+                        log.info(f"[ACTIVATION] Cleared stale pending event {eid} from old session")
+                    # Clean up other old session state
+                    self.typing_sessions.pop(old_session_id, None)
+                    self.typing_last_sent.pop(old_session_id, None)
+                    self.last_idle_ping.pop(old_session_id, None)
+                    self.interaction_counts.pop(old_session_id, None)
+                    self.context_warning_sent.pop(old_session_id, None)
+                    self.trusted_sessions.pop(old_session_id, None)
+                    self.approval_counts.pop(old_session_id, None)
+                    self.permission_batch.pop(old_session_id, None)
+
+                # Try to reattach to existing Telegram topic (session was Ctrl+C'd)
+                log.info(f"[ACTIVATION] Attempting reattach to thread_id={reuse_thread_id}")
+                res = self.tg.send_message(f"🔄 <b>AFK Reattached</b>\nProject: {escape_html(project)}", thread_id=reuse_thread_id)
+
+                if res and res.get("ok"):
+                    # Topic still exists — reuse it
+                    thread_id = reuse_thread_id
+                    self.session_threads[session_id] = thread_id
+                    log.info(f"[ACTIVATION] Reattached to existing topic thread_id={thread_id}")
+                else:
+                    # Topic was deleted — fall through to create new one
+                    log.info(f"[ACTIVATION] Topic {reuse_thread_id} gone, creating new one")
+                    reuse_thread_id = None  # Fall through to creation below
+
+            if not reuse_thread_id:
+                # Create new Telegram topic
+                log.info(f"[ACTIVATION] Creating topic '{topic_name}' for {project}")
+                res = self.tg.create_forum_topic(topic_name)
+
+                if res and res.get("ok"):
+                    thread_id = res["result"]["message_thread_id"]
+                    self.session_threads[session_id] = thread_id
+                    log.info(f"[ACTIVATION] Topic created: thread_id={thread_id}")
+                    # Persist thread_id to state.json so hook.py can delete topic as fallback
+                    try:
+                        st = load_state()
+                        for s_num, s_info in st.get("slots", {}).items():
+                            if s_info.get("session_id") == session_id:
+                                s_info["thread_id"] = thread_id
+                                save_state(st)
+                                break
+                    except Exception as e:
+                        log.error(f"[ACTIVATION] Failed to persist thread_id: {e}")
+                else:
+                    log.error(f"[ACTIVATION] Failed to create topic: {res}")
+
+                self.tg.send_message(f"📡 <b>AFK Activated</b>\nProject: {escape_html(project)}", thread_id=thread_id)
+
             self.last_idle_ping[session_id] = time.time()
 
         elif etype == "deactivation":
@@ -360,19 +445,18 @@ class BridgeDaemon:
 
         elif etype == "permission_request":
             self._increment_interaction(session_id)
-            text = format_permission_message(event, slot)
-            kb = permission_keyboard(event_id)
-            result = self._send_to_session(text, session_id, reply_markup=kb)
-            if result and result.get("ok"):
-                self.pending_events[event_id] = {
-                    "session_id": session_id,
-                    "type": "permission_request",
-                    "message_id": result["result"]["message_id"],
-                    "slot": slot
+            batch_window = self.config.get("permission_batch_window_seconds", 2)
+
+            if session_id not in self.permission_batch:
+                self.permission_batch[session_id] = {
+                    "events": [],
+                    "timer_start": time.time(),
+                    "thread_id": thread_id,
+                    "slot": slot,
                 }
-                log.info(f"[PERMISSION] Sent to Telegram, msg_id={result['result']['message_id']}")
-            else:
-                log.error(f"[PERMISSION] Failed to send: {result}")
+
+            self.permission_batch[session_id]["events"].append(event)
+            log.info(f"[PERMISSION] Queued event {event_id} for batching ({len(self.permission_batch[session_id]['events'])} in batch)")
 
         elif etype == "stop":
             self._increment_interaction(session_id)
@@ -410,14 +494,15 @@ class BridgeDaemon:
                 text = f"<i>Reply to give next instruction...</i>"
             else:
                 text = format_stop_message(event, slot)
-            kb = stop_keyboard(event_id)
+            kb = stop_keyboard(event_id, session_id)
             result = self._send_to_session(text, session_id, reply_markup=kb)
             if result and result.get("ok"):
                 self.pending_events[event_id] = {
                     "session_id": session_id,
                     "type": "stop",
                     "message_id": result["result"]["message_id"],
-                    "slot": slot
+                    "slot": slot,
+                    "created_at": time.time()
                 }
                 log.info(f"[STOP] Sent to Telegram, msg_id={result['result']['message_id']}")
             else:
@@ -454,10 +539,13 @@ class BridgeDaemon:
                 log.debug(f"[KEEPALIVE] Session {session_id[:8]} alive, next ping in {int(idle_ping_seconds - (now - last_ping))}s")
 
     def _handle_update(self, update):
+        log.debug("[UPDATE] Received: %s", json.dumps(update)[:200])
         if "callback_query" in update:
             self._handle_callback(update["callback_query"])
         elif "message" in update:
             self._handle_message(update["message"])
+        else:
+            log.debug("[UPDATE] Ignored update (no message or callback)")
 
     def _handle_callback(self, cq):
         data = cq.get("data", "")
@@ -470,7 +558,7 @@ class BridgeDaemon:
         action, event_id = data.split(":", 1)
 
         # Context management callbacks don't use pending_events
-        if action in ("compact", "clear", "dismiss_ctx"):
+        if action in ("compact", "clear", "dismiss_ctx", "end_session", "approve_all", "deny_all", "trust_session"):
             pass  # handled below, skip pending lookup
         else:
             pending = self.pending_events.get(event_id)
@@ -485,9 +573,11 @@ class BridgeDaemon:
 
         if action == "allow":
             self._write_response(ipc_session_dir, event_id, {"decision": "allow"})
+            self.typing_sessions[session_id] = True
             self.tg.answer_callback(cq_id, "Approved")
             self.tg.edit_message(msg_id, f"✅ Approved")
             del self.pending_events[event_id]
+            self._track_approval(session_id)
 
         elif action == "deny":
             self._write_response(ipc_session_dir, event_id, {"decision": "deny", "message": "Denied via Telegram"})
@@ -500,6 +590,59 @@ class BridgeDaemon:
             self.tg.answer_callback(cq_id, "Stopping")
             self.tg.edit_message(msg_id, f"🛑 Stopped")
             del self.pending_events[event_id]
+
+        elif action == "end_session":
+            target_sid = event_id  # callback_data is "end_session:{session_id}"
+            self.tg.answer_callback(cq_id, "Ending AFK session...")
+            thread_id = self.session_threads.get(target_sid)
+            if thread_id:
+                self.tg.send_message("👋 <b>AFK Session ended from Telegram</b>", thread_id=thread_id)
+            self._kill_session(target_sid, "ended from Telegram")
+            # Also resolve any pending stop events for this session
+            for eid in list(self.pending_events.keys()):
+                if self.pending_events[eid]["session_id"] == target_sid:
+                    del self.pending_events[eid]
+            # Clean up typing
+            self.typing_sessions.pop(target_sid, None)
+
+        elif action in ("approve_all", "deny_all"):
+            batch_id = event_id  # callback_data is "approve_all:{batch_id}"
+            batch_info = self.pending_events.get(batch_id)
+            if not batch_info:
+                self.tg.answer_callback(cq_id, "Batch expired")
+                return
+            session_id = batch_info["session_id"]
+            ipc_dir = IPC_DIR / session_id
+            decision = "allow" if action == "approve_all" else "deny"
+            msg = "" if action == "approve_all" else "Denied via Telegram (batch)"
+
+            for eid in batch_info.get("event_ids", []):
+                if decision == "allow":
+                    self._write_response(ipc_dir, eid, {"decision": "allow"})
+                else:
+                    self._write_response(ipc_dir, eid, {"decision": "deny", "message": msg})
+
+            count = len(batch_info.get("event_ids", []))
+            label = "Approved" if action == "approve_all" else "Denied"
+            self.tg.answer_callback(cq_id, f"{label} {count} requests")
+            self.tg.edit_message(batch_info["message_id"], f"{'✅' if decision == 'allow' else '❌'} {label} all ({count})")
+            del self.pending_events[batch_id]
+
+            # Track approvals for session trust
+            if decision == "allow":
+                self._track_approval(session_id, count)
+            # Start typing if approved
+            if decision == "allow":
+                self.typing_sessions[session_id] = True
+
+        elif action == "trust_session":
+            target_sid = event_id
+            self.trusted_sessions[target_sid] = True
+            self.tg.answer_callback(cq_id, "Session trusted!")
+            thread_id = self.session_threads.get(target_sid)
+            if thread_id:
+                self.tg.send_message("🔓 <b>Session trusted</b> — all permissions will auto-approve", thread_id=thread_id)
+            log.info(f"[TRUST] Session {target_sid[:8]} trusted by user")
 
         elif action == "compact":
             # session_id is in event_id position for context commands
@@ -560,6 +703,15 @@ class BridgeDaemon:
                 except OSError:
                     pass
 
+            # Always write force_clear as backup
+            force_clear_path = IPC_DIR / target_sid / "force_clear"
+            try:
+                with open(force_clear_path, "w") as f:
+                    f.write(str(time.time()))
+                log.info(f"[CLEAR] Wrote force_clear for session {target_sid[:8]}")
+            except OSError:
+                pass
+
             self.tg.answer_callback(cq_id, "Clearing context...")
             thread_id = self.session_threads.get(target_sid)
             if thread_id:
@@ -568,24 +720,115 @@ class BridgeDaemon:
             # Reset interaction counter
             self.interaction_counts[target_sid] = 0
             self.context_warning_sent[target_sid] = 0
+            self.trusted_sessions.pop(target_sid, None)
+            self.approval_counts.pop(target_sid, None)
 
         elif action == "dismiss_ctx":
             self.tg.answer_callback(cq_id, "Dismissed")
+
+    def _get_session_for_message(self, msg_thread_id):
+        """Find session ID for a given message thread ID.
+
+        Returns the session ID mapped to this topic, or the only active
+        session if no topic match is found. Returns None if no session found.
+        """
+        # Try to find session by topic thread ID
+        for sid, t_id in self.session_threads.items():
+            if t_id == msg_thread_id:
+                return sid
+
+        # Fallback — if no topic match, route to the only active session
+        state = load_state()
+        active = get_active_sessions(state)
+        if len(active) == 1:
+            return list(active.keys())[0]
+
+        return None
 
     def _handle_message(self, msg):
         text = msg.get("text", "").strip()
         chat_id = str(msg.get("chat", {}).get("id", ""))
 
-        # Wyciągamy ID tematu (wątku) z wiadomości
+        # Extract topic thread ID from message
         msg_thread_id = msg.get("message_thread_id")
 
+        log.info("[MSG] chat_id=%s (expected=%s) thread=%s text=%s",
+                 chat_id, self.tg.chat_id, msg_thread_id, text[:100])
+
         if chat_id != self.tg.chat_id or not text:
+            log.info("[MSG] Dropped: chat_id_match=%s has_text=%s", chat_id == self.tg.chat_id, bool(text))
             return
 
         # Strip @botname suffix from commands (Telegram adds it in groups)
         # e.g. "/clear@Clade_motyl_ai_bot" -> "/clear"
         if text.startswith("/") and "@" in text.split()[0]:
             text = text.split("@")[0]
+
+        # Handle /ping — daemon answers directly, no IPC needed
+        if text.lower() == "/ping":
+            target_session = self._get_session_for_message(msg_thread_id)
+
+            if target_session:
+                # Check last event timestamp
+                event_file = IPC_DIR / target_session / "events.jsonl"
+                last_activity = 0
+                try:
+                    if event_file.exists():
+                        with open(event_file) as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        ev = json.loads(line)
+                                        ts = ev.get("timestamp", 0)
+                                        if ts > last_activity:
+                                            last_activity = ts
+                                    except json.JSONDecodeError:
+                                        pass
+                except OSError:
+                    pass
+
+                now = time.time()
+                if last_activity > 0:
+                    age = int(now - last_activity)
+                    if age < 60:
+                        status = f"🏓 Agent alive — last activity {age}s ago"
+                    elif age < 300:
+                        status = f"⚠️ Agent slow — last activity {age}s ago. Try /clear if stuck"
+                    else:
+                        status = f"💀 Agent likely stuck — no activity for {age}s. Use /clear to restart"
+                else:
+                    status = "❓ No activity data available"
+
+                # Check if there's a pending event waiting for response
+                pending_info = ""
+                for eid, info in self.pending_events.items():
+                    if info["session_id"] == target_session:
+                        pending_info = f"\n📋 Pending: {info['type']} (event {eid})"
+                        break
+
+                self.tg.send_message(
+                    f"{status}{pending_info}",
+                    thread_id=msg_thread_id,
+                )
+            else:
+                self.tg.send_message("❓ No session found for this topic", thread_id=msg_thread_id)
+            return
+
+        # Handle /end — terminate AFK session from Telegram
+        if text.lower() == "/end":
+            target_session = self._get_session_for_message(msg_thread_id)
+
+            if target_session:
+                self.tg.send_message("👋 <b>AFK Session ended from Telegram</b>", thread_id=msg_thread_id)
+                self._kill_session(target_session, "ended from Telegram via /end")
+                for eid in list(self.pending_events.keys()):
+                    if self.pending_events[eid]["session_id"] == target_session:
+                        del self.pending_events[eid]
+                self.typing_sessions.pop(target_session, None)
+            else:
+                self.tg.send_message("❓ No session found for this topic", thread_id=msg_thread_id)
+            return
 
         # Intercept context management commands
         COMPACT_INSTRUCTION = (
@@ -636,6 +879,16 @@ class BridgeDaemon:
                     except OSError:
                         pass
 
+                # Always write force_clear as backup (bypasses stuck IPC)
+                if command == "clear":
+                    force_clear_path = IPC_DIR / target_session / "force_clear"
+                    try:
+                        with open(force_clear_path, "w") as f:
+                            f.write(str(time.time()))
+                        log.info(f"[CLEAR] Wrote force_clear for session {target_session[:8]}")
+                    except OSError:
+                        pass
+
                 self.tg.send_message(
                     f"{'📦' if command == 'compact' else '🗑'} Sending /{command} to Claude...",
                     thread_id=msg_thread_id,
@@ -646,27 +899,29 @@ class BridgeDaemon:
                 if command == "clear":
                     self.interaction_counts[target_session] = 0
                     self.context_warning_sent[target_session] = 0
+                    self.trusted_sessions.pop(target_session, None)
+                    self.approval_counts.pop(target_session, None)
             return
 
-        # Szukamy sesji, do której przypisany jest ten konkretny Temat
+        # Find session assigned to this topic thread
         target_session = None
         for sid, t_id in self.session_threads.items():
             if t_id == msg_thread_id:
                 target_session = sid
                 break
 
-        # Fallback - jeśli nie ma topiców, uderz do jedynej aktywnej sesji
+        # Fallback — if no topic match, route to the only active session
         if not target_session:
             state = load_state()
             active = get_active_sessions(state)
             if len(active) == 1:
                 target_session = list(active.keys())[0]
             else:
-                return  # Ignorujemy wiadomości wysłane w głównym czacie, jeśli jest kilka sesji
+                return  # Ignore messages in main chat when multiple sessions active
 
         ipc_session_dir = IPC_DIR / target_session
 
-        # Szukamy, czy Claude na nas czeka (status "stop")
+        # Check if Claude is waiting for instruction (stop event pending)
         stop_event_id = None
         for eid, info in self.pending_events.items():
             if info["session_id"] == target_session and info["type"] == "stop":
@@ -674,15 +929,16 @@ class BridgeDaemon:
                 break
 
         if stop_event_id:
-            # Natychmiastowe wysłanie instrukcji
+            # Send instruction immediately — Claude is waiting
             self._write_response(ipc_session_dir, stop_event_id, {"instruction": text})
+            self.typing_sessions[target_session] = True
             msg_id = self.pending_events[stop_event_id]["message_id"]
             self.tg.edit_message(msg_id, f"▶️ Continuing: <i>{escape_html(text[:200])}</i>")
             del self.pending_events[stop_event_id]
-            self.tg.send_message(f"📨 Wysłano do Agenta", thread_id=msg_thread_id)
+            self.tg.send_message(f"📨 Sent to Agent", thread_id=msg_thread_id)
             self._increment_interaction(target_session)
         else:
-            # MESSAGE BUFFER: Claude pracuje, więc dołączamy to do kolejki
+            # MESSAGE BUFFER: Claude is busy, queue the instruction
             queued_path = ipc_session_dir / "queued_instruction.json"
             existing_instruction = ""
             if queued_path.exists():
@@ -697,7 +953,7 @@ class BridgeDaemon:
             try:
                 with open(queued_path, "w") as f:
                     json.dump({"instruction": final_instruction, "timestamp": time.time()}, f)
-                self.tg.send_message(f"📥 Dodano do kolejki instrukcji.", thread_id=msg_thread_id)
+                self.tg.send_message(f"📥 Queued instruction (agent busy).", thread_id=msg_thread_id)
                 self._increment_interaction(target_session)
             except OSError:
                 pass
@@ -711,7 +967,7 @@ class BridgeDaemon:
             log.error("Failed to write response %s: %s", response_path, e)
 
     def _kill_session(self, session_id, reason="topic deleted"):
-        """Write kill file and clean up session state."""
+        """Write kill file, delete topic, and clean up session state."""
         ipc_session_dir = IPC_DIR / session_id
         kill_path = ipc_session_dir / "kill"
         try:
@@ -720,6 +976,12 @@ class BridgeDaemon:
             log.info(f"[KILL] Wrote kill file for session {session_id[:8]}: {reason}")
         except OSError as e:
             log.error(f"[KILL] Failed to write kill file: {e}")
+
+        # Delete the forum topic
+        topic_id = self.session_threads.get(session_id)
+        if topic_id:
+            log.info(f"[KILL] Deleting topic {topic_id} for session {session_id[:8]}")
+            self.tg.delete_forum_topic(topic_id)
 
         # Clean up daemon state
         if session_id in self.session_threads:
@@ -800,6 +1062,138 @@ class BridgeDaemon:
         ]}
         self.tg.send_message(text, thread_id=thread_id, reply_markup=kb)
         log.info(f"[CONTEXT] Warning sent for session {session_id[:8]} at count={count}")
+
+    def _update_typing(self):
+        """Send typing action for sessions where Claude is working."""
+        now = time.time()
+        for session_id in list(self.typing_sessions.keys()):
+            if not self.typing_sessions.get(session_id):
+                continue
+            last = self.typing_last_sent.get(session_id, 0)
+            if now - last >= 4.5:
+                thread_id = self.session_threads.get(session_id)
+                if thread_id:
+                    self.tg.send_chat_action("typing", thread_id=thread_id)
+                self.typing_last_sent[session_id] = now
+
+    def _check_stale_events(self):
+        """Warn if pending events have been waiting too long."""
+        stale_seconds = self.config.get("stale_warning_seconds", 90)
+        now = time.time()
+        for event_id, info in list(self.pending_events.items()):
+            created = info.get("created_at", now)
+            session_id = info["session_id"]
+            warned_key = f"stale_{event_id}"
+
+            if now - created > stale_seconds and warned_key not in self.context_warning_sent:
+                age = int(now - created)
+                thread_id = self.session_threads.get(session_id)
+                if thread_id:
+                    self.tg.send_message(
+                        f"⚠️ Agent may be unresponsive — pending {info['type']} for {age}s.\nTry /ping or /clear",
+                        thread_id=thread_id,
+                    )
+                self.context_warning_sent[warned_key] = True
+                log.warning(f"[STALE] Event {event_id} pending for {age}s")
+
+    def _flush_permission_batches(self):
+        """Send batched permission requests that have waited long enough."""
+        batch_window = self.config.get("permission_batch_window_seconds", 2)
+        now = time.time()
+
+        for session_id in list(self.permission_batch.keys()):
+            batch = self.permission_batch[session_id]
+            if now - batch["timer_start"] < batch_window:
+                continue  # Still collecting
+
+            events = batch["events"]
+            thread_id = batch["thread_id"]
+            slot = batch["slot"]
+            del self.permission_batch[session_id]
+
+            if len(events) == 1:
+                # Single request — use normal format
+                event = events[0]
+                event_id = event["id"]
+                text = format_permission_message(event, slot)
+                # Check session trust
+                if self._is_session_trusted(session_id):
+                    self._auto_approve_permission(event, session_id)
+                    continue
+                kb = permission_keyboard(event_id)
+                result = self._send_to_session(text, session_id, reply_markup=kb)
+                if result and result.get("ok"):
+                    self.pending_events[event_id] = {
+                        "session_id": session_id,
+                        "type": "permission_request",
+                        "message_id": result["result"]["message_id"],
+                        "slot": slot,
+                        "created_at": time.time(),
+                    }
+            else:
+                # Batch — combined message with Approve All
+                batch_id = str(uuid.uuid4())[:8]
+                lines = [f"🔐 <b>Permission Requests ({len(events)})</b>\n"]
+                event_ids = []
+                for i, ev in enumerate(events, 1):
+                    tool = ev.get("tool_name", "?")
+                    desc = ev.get("description", "")
+                    short_desc = desc.split("\n")[0][:80] if desc else ""
+                    lines.append(f"{i}. <b>{escape_html(tool)}</b>: {escape_html(short_desc)}")
+                    event_ids.append(ev["id"])
+
+                text = "\n".join(lines)
+                # Check session trust
+                if self._is_session_trusted(session_id):
+                    for ev in events:
+                        self._auto_approve_permission(ev, session_id)
+                    continue
+
+                kb = {"inline_keyboard": [
+                    [{"text": f"✅ Approve All ({len(events)})", "callback_data": f"approve_all:{batch_id}"},
+                     {"text": "❌ Deny All", "callback_data": f"deny_all:{batch_id}"}],
+                ]}
+                result = self._send_to_session(text, session_id, reply_markup=kb)
+                if result and result.get("ok"):
+                    self.pending_events[batch_id] = {
+                        "session_id": session_id,
+                        "type": "permission_batch",
+                        "message_id": result["result"]["message_id"],
+                        "event_ids": event_ids,
+                        "slot": slot,
+                        "created_at": time.time(),
+                    }
+
+    def _is_session_trusted(self, session_id):
+        return self.trusted_sessions.get(session_id, False)
+
+    def _track_approval(self, session_id, count=1):
+        """Track approval count and offer trust after threshold."""
+        self.approval_counts[session_id] = self.approval_counts.get(session_id, 0) + count
+        threshold = self.config.get("session_trust_threshold", 3)
+        if self.approval_counts[session_id] >= threshold and not self._is_session_trusted(session_id):
+            thread_id = self.session_threads.get(session_id)
+            if thread_id:
+                kb = {"inline_keyboard": [
+                    [{"text": "🔓 Trust this session", "callback_data": f"trust_session:{session_id}"}],
+                ]}
+                self.tg.send_message(
+                    f"💡 You've approved {self.approval_counts[session_id]} requests. Trust this session to auto-approve?",
+                    thread_id=thread_id,
+                    reply_markup=kb,
+                )
+
+    def _auto_approve_permission(self, event, session_id):
+        """Auto-approve a permission request (for trusted sessions)."""
+        event_id = event["id"]
+        ipc_dir = IPC_DIR / session_id
+        self._write_response(ipc_dir, event_id, {"decision": "allow"})
+        tool_name = event.get("tool_name", "?")
+        thread_id = self.session_threads.get(session_id)
+        if thread_id:
+            self.tg.send_message(f"✅ Auto-approved (trusted): {escape_html(tool_name)}", thread_id=thread_id)
+        self.typing_sessions[session_id] = True
+        log.info(f"[TRUST] Auto-approved {tool_name} for trusted session {session_id[:8]}")
 
 
 if __name__ == "__main__":

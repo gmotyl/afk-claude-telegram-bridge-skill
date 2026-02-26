@@ -14,6 +14,7 @@ import fcntl
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -86,6 +87,104 @@ def is_daemon_alive(state):
         return False
 
 
+def is_slot_actually_active(state, slot_num, current_time=None):
+    """
+    Validate that a slot has an active, living session.
+
+    A slot is considered ACTIVE if:
+    - IPC directory exists
+    - meta.json exists (proof of initialization)
+    - No kill file present (daemon didn't intentionally terminate)
+    - Daemon is alive OR heartbeat is recent (<60s)
+
+    Returns: (is_active: bool, reason: str or None)
+    reason is provided only if is_active is False
+    """
+    if current_time is None:
+        current_time = time.time()
+
+    if slot_num not in state.get("slots", {}):
+        return False, "slot_not_in_state"
+
+    info = state["slots"][slot_num]
+    session_id = info.get("session_id")
+
+    if not session_id:
+        return False, "session_id_missing"
+
+    ipc_session_dir = os.path.join(IPC_DIR, session_id)
+
+    # Check if IPC directory exists
+    if not os.path.isdir(ipc_session_dir):
+        return False, "ipc_dir_missing"
+
+    # Check if meta.json exists (proof of successful initialization)
+    meta_path = os.path.join(ipc_session_dir, "meta.json")
+    if not os.path.isfile(meta_path):
+        return False, "meta_missing"
+
+    # Check if kill file exists (daemon intentionally terminated this session)
+    kill_file = os.path.join(ipc_session_dir, "kill")
+    if os.path.exists(kill_file):
+        return False, "kill_file_present"
+
+    # Check daemon liveness
+    daemon_alive = is_daemon_alive(state)
+    if daemon_alive:
+        return True, None
+
+    # Daemon is not alive; check heartbeat freshness
+    daemon_heartbeat = state.get("daemon_heartbeat", 0)
+    heartbeat_age = current_time - daemon_heartbeat
+
+    # If heartbeat is fresh (<60s), daemon might still be initializing
+    if heartbeat_age < 60:
+        return True, None
+
+    # Both daemon dead and heartbeat stale
+    return False, "daemon_dead"
+
+
+def cleanup_stale_slots(state, preserve_ipc_dirs=False, verbose=False):
+    """
+    Remove stale slots from state.json and optionally clean IPC directories.
+
+    Returns: List of (slot_num, session_id, reason) tuples for cleaned slots
+    """
+    cleaned = []
+    # Ensure slots dict exists in state
+    if "slots" not in state:
+        state["slots"] = {}
+    slots = state["slots"]
+
+    for slot_num in list(slots.keys()):
+        is_active, reason = is_slot_actually_active(state, slot_num)
+
+        if not is_active:
+            session_id = slots[slot_num].get("session_id", "unknown")
+            cleaned.append((slot_num, session_id, reason))
+
+            if verbose:
+                log.info(f"Cleaning stale slot S{slot_num} "
+                        f"(session: {session_id[:8]}..., reason: {reason})")
+
+            # Optionally remove IPC directory
+            if not preserve_ipc_dirs:
+                ipc_session_dir = os.path.join(IPC_DIR, session_id)
+                if os.path.isdir(ipc_session_dir):
+                    try:
+                        shutil.rmtree(ipc_session_dir)
+                        if verbose:
+                            log.info(f"Removed IPC directory for S{slot_num}")
+                    except Exception as e:
+                        log.warning(f"Failed to remove IPC dir for S{slot_num}: {e}")
+
+            # Remove from state
+            del slots[slot_num]
+
+    return cleaned
+
+
 def start_daemon():
     """Start the bridge daemon as a detached background process."""
     log_path = os.path.join(BRIDGE_DIR, "daemon.log")
@@ -111,6 +210,52 @@ def stop_daemon(state):
             pass
     state["daemon_pid"] = None
     state["daemon_heartbeat"] = None
+
+
+def check_pending_telegram_instructions():
+    """
+    Actively check for pending Telegram instructions and display them.
+    This runs continuously to enable real-time AFK mode.
+    """
+    try:
+        state = load_state()
+        slots = state.get("slots", {})
+
+        if not slots:
+            return
+
+        # Check first active session
+        for slot_num, info in slots.items():
+            session_id = info.get("session_id")
+            if not session_id:
+                continue
+
+            ipc_dir = os.path.join(IPC_DIR, session_id)
+            instruction_file = os.path.join(ipc_dir, "queued_instruction.json")
+
+            if os.path.isfile(instruction_file):
+                try:
+                    with open(instruction_file) as f:
+                        data = json.load(f)
+                    instruction = data.get("instruction", "").strip()
+
+                    if instruction:
+                        # Display to user
+                        print(f"\n📱 **Telegram Instruction:**\n```\n{instruction}\n```\n")
+
+                        # Clear instruction
+                        try:
+                            os.remove(instruction_file)
+                            log.info(f"[TELEGRAM] Delivered instruction from session {session_id[:8]}")
+                        except:
+                            pass
+                        return True
+                except:
+                    pass
+    except:
+        pass
+
+    return False
 
 
 # ─── Setup ───────────────────────────────────────────────────────────────────
@@ -321,6 +466,25 @@ def cmd_activate(session_id, project, topic_name=""):
     def do_activate(state):
         slots = state.setdefault("slots", {})
 
+        # Clean up any stale slots first (self-healing)
+        cleaned = cleanup_stale_slots(state, preserve_ipc_dirs=False, verbose=False)
+        if cleaned:
+            for slot_num, sid, reason in cleaned:
+                log.info(f"[ACTIVATE] Cleaned stale slot S{slot_num} "
+                        f"(session: {sid[:8]}..., reason: {reason})")
+
+        # Clean up orphaned IPC directories (dirs with no matching slot in state)
+        active_session_ids = {info.get("session_id") for info in slots.values()}
+        if os.path.isdir(IPC_DIR):
+            for dirname in os.listdir(IPC_DIR):
+                dirpath = os.path.join(IPC_DIR, dirname)
+                if os.path.isdir(dirpath) and dirname not in active_session_ids:
+                    try:
+                        shutil.rmtree(dirpath)
+                        log.info(f"[ACTIVATE] Removed orphaned IPC dir: {dirname[:12]}...")
+                    except Exception as e:
+                        log.warning(f"[ACTIVATE] Failed to remove orphaned IPC dir {dirname}: {e}")
+
         # Check if already active
         for slot_num, info in slots.items():
             if info.get("session_id") == session_id:
@@ -329,19 +493,42 @@ def cmd_activate(session_id, project, topic_name=""):
 
 
         # Check for duplicate project+topic (different session_id, same intent)
+        reuse_thread_id = None
+        reuse_slot = None
         for slot_num, info in slots.items():
             if (info.get("project") == (project or "unknown")
                     and info.get("topic_name") == (topic_name or f"S{slot_num} - {project or 'unknown'}")):
-                print(f"⚠️  Duplicate detected: project '{project}' already active in slot S{slot_num}")
-                print(f"   Run /back first, then /afk again.")
-                sys.exit(1)
-        # Find next available slot
-        assigned_slot = None
-        for i in range(1, max_slots + 1):
-            s = str(i)
-            if s not in slots:
-                assigned_slot = s
-                break
+                # Found duplicate - check if it's truly active or stale
+                dup_session_id = info.get("session_id")
+                is_active, _ = is_slot_actually_active(state, slot_num)
+
+                if is_active and dup_session_id == session_id:
+                    # Same session already active - just return slot number
+                    print(f"Session already active in slot S{slot_num}")
+                    return slot_num
+                else:
+                    # Different session or stale - reuse thread_id and slot number
+                    reuse_thread_id = info.get("thread_id")
+                    reuse_slot = slot_num
+                    log.info(f"[ACTIVATE] Reattaching: old session {dup_session_id[:8]} → new {session_id[:8]} "
+                            f"(thread_id={reuse_thread_id}, slot=S{slot_num})")
+                    del slots[slot_num]
+                    # Clean up IPC for old session
+                    old_ipc = os.path.join(IPC_DIR, dup_session_id)
+                    if os.path.isdir(old_ipc):
+                        try:
+                            shutil.rmtree(old_ipc)
+                        except:
+                            pass
+                    break  # Continue with new activation
+        # Find next available slot (prefer reused slot for continuity)
+        assigned_slot = reuse_slot if reuse_slot and reuse_slot not in slots else None
+        if assigned_slot is None:
+            for i in range(1, max_slots + 1):
+                s = str(i)
+                if s not in slots:
+                    assigned_slot = s
+                    break
 
         if assigned_slot is None:
             print(f"All {max_slots} slots are occupied:")
@@ -351,12 +538,16 @@ def cmd_activate(session_id, project, topic_name=""):
             sys.exit(1)
 
         # Claim slot
-        slots[assigned_slot] = {
+        slot_info = {
             "session_id": session_id,
             "project": project or "unknown",
             "topic_name": topic_name or f"S{assigned_slot} - {project or 'unknown'}",
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # Carry forward thread_id for reattachment
+        if reuse_thread_id:
+            slot_info["thread_id"] = reuse_thread_id
+        slots[assigned_slot] = slot_info
 
         # Create IPC directory
         ipc_session_dir = os.path.join(IPC_DIR, session_id)
@@ -391,6 +582,9 @@ def cmd_activate(session_id, project, topic_name=""):
             "session_id": session_id,
             "timestamp": time.time(),
         }
+        # If reattaching, pass existing thread_id so daemon reuses the topic
+        if reuse_thread_id:
+            event["reuse_thread_id"] = reuse_thread_id
         with open(event_file, "a") as f:
             f.write(json.dumps(event) + "\n")
 
@@ -454,6 +648,23 @@ def cmd_deactivate(session_id):
                     break
                 time.sleep(0.3)
 
+            # Fallback: if daemon didn't process, delete topic directly
+            if not os.path.exists(processed_path):
+                thread_id = slots.get(removed_slot, {}).get("thread_id")
+                if thread_id:
+                    log.info(f"[DEACTIVATE] Daemon didn't process, deleting topic {thread_id} directly")
+                    try:
+                        config = load_config()
+                        token = config.get("bot_token", "")
+                        chat_id = config.get("chat_id", "")
+                        if token and chat_id:
+                            url = f"https://api.telegram.org/bot{token}/deleteForumTopic"
+                            data = json.dumps({"chat_id": chat_id, "message_thread_id": thread_id}).encode()
+                            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+                            urllib.request.urlopen(req, timeout=5)
+                    except Exception as e:
+                        log.error(f"[DEACTIVATE] Fallback topic delete failed: {e}")
+
         # NOW remove the slot from state.json (after daemon has processed the event)
         del slots[removed_slot]
 
@@ -465,6 +676,12 @@ def cmd_deactivate(session_id):
         # Stop daemon if no sessions remain
         if not slots:
             stop_daemon(state)
+            # Clean ALL remaining IPC dirs when last session deactivated
+            if os.path.isdir(IPC_DIR):
+                for dirname in os.listdir(IPC_DIR):
+                    dirpath = os.path.join(IPC_DIR, dirname)
+                    if os.path.isdir(dirpath):
+                        shutil.rmtree(dirpath, ignore_errors=True)
 
         print(f"AFK mode deactivated — slot S{removed_slot} released.")
 
@@ -591,18 +808,36 @@ def cmd_hook():
     if hook_event == "PermissionRequest":
         tool_name = event_data.get("tool_name", "")
 
-        # Auto-approve read-only tools
+        # Auto-approve: check tool name + optional path matching
         if tool_name in auto_approve:
-            result = {
-                "hookSpecificOutput": {
-                    "hookEventName": "PermissionRequest",
-                    "decision": {
-                        "behavior": "allow",
+            auto_paths = config.get("auto_approve_paths", [])
+            should_approve = False
+
+            if not auto_paths:
+                # No path rules — auto-approve by tool name alone
+                should_approve = True
+            else:
+                # Extract path from tool input
+                tool_input = event_data.get("tool_input", {})
+                file_path = (tool_input.get("file_path") or
+                             tool_input.get("path") or
+                             tool_input.get("notebook_path") or "")
+                if not file_path:
+                    # Tool has no path (e.g. WebSearch) — auto-approve by tool name alone
+                    should_approve = True
+                else:
+                    import fnmatch
+                    should_approve = any(fnmatch.fnmatch(file_path, pat) for pat in auto_paths)
+
+            if should_approve:
+                result = {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PermissionRequest",
+                        "decision": {"behavior": "allow"},
                     },
-                },
-            }
-            json.dump(result, sys.stdout)
-            sys.exit(0)
+                }
+                json.dump(result, sys.stdout)
+                sys.exit(0)
 
         # Write event for Telegram approval
         event_id = str(uuid.uuid4())[:8]
@@ -698,7 +933,9 @@ def cmd_hook():
 
             # Kill file detected — exit cleanly
             if response and response.get("_killed"):
-                log.info("[STOP] Killed by daemon (topic deleted)")
+                reason = response.get("_reason", "topic deleted")
+                print(f"\n🔚 AFK session ended from Telegram ({reason}). Returning control to local console.", file=sys.stderr)
+                log.info(f"[STOP] Killed by daemon: {reason}")
                 sys.exit(0)
 
             # Got instruction from user
@@ -785,15 +1022,32 @@ def _check_kill_file(ipc_dir):
 
 
 def _poll_response_or_kill(ipc_dir, event_id, timeout):
-    """Poll for response, but exit early if kill file appears."""
+    """Poll for response, but exit early if kill or force_clear appears."""
     response_path = os.path.join(ipc_dir, f"response-{event_id}.json")
+    force_clear_path = os.path.join(ipc_dir, "force_clear")
     deadline = time.time() + timeout
     interval = 0.5
 
     while time.time() < deadline:
         if _check_kill_file(ipc_dir):
-            log.info("[POLL] Kill file detected, exiting")
-            return {"_killed": True}
+            reason = "unknown"
+            kill_path = os.path.join(ipc_dir, "kill")
+            try:
+                with open(kill_path) as f:
+                    reason = f.read().strip() or "unknown"
+            except OSError:
+                pass
+            log.info(f"[POLL] Kill file detected: {reason}")
+            return {"_killed": True, "_reason": reason}
+
+        # Check force_clear
+        if os.path.exists(force_clear_path):
+            try:
+                os.remove(force_clear_path)
+            except OSError:
+                pass
+            log.info("[POLL] force_clear detected, returning /clear instruction")
+            return {"instruction": "/clear"}
 
         if os.path.exists(response_path):
             try:
@@ -813,10 +1067,20 @@ def _poll_response_or_kill(ipc_dir, event_id, timeout):
 def _poll_response(ipc_dir, event_id, timeout):
     """Poll for a response file written by the daemon. Returns dict or None."""
     response_path = os.path.join(ipc_dir, f"response-{event_id}.json")
+    force_clear_path = os.path.join(ipc_dir, "force_clear")
     deadline = time.time() + timeout
     interval = 0.5
 
     while time.time() < deadline:
+        # Check force_clear first (bypasses stuck IPC)
+        if os.path.exists(force_clear_path):
+            try:
+                os.remove(force_clear_path)
+            except OSError:
+                pass
+            log.info("[POLL] force_clear detected, returning allow decision")
+            return {"decision": "allow"}
+
         if os.path.exists(response_path):
             try:
                 with open(response_path) as f:
@@ -826,7 +1090,6 @@ def _poll_response(ipc_dir, event_id, timeout):
             except (json.JSONDecodeError, OSError):
                 pass
         time.sleep(interval)
-        # Gradually increase poll interval (0.5s → 1s → 2s)
         if interval < 2.0:
             interval = min(interval * 1.2, 2.0)
 
