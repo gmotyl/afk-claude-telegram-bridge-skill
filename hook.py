@@ -212,6 +212,52 @@ def stop_daemon(state):
     state["daemon_heartbeat"] = None
 
 
+def check_pending_telegram_instructions():
+    """
+    Actively check for pending Telegram instructions and display them.
+    This runs continuously to enable real-time AFK mode.
+    """
+    try:
+        state = load_state()
+        slots = state.get("slots", {})
+
+        if not slots:
+            return
+
+        # Check first active session
+        for slot_num, info in slots.items():
+            session_id = info.get("session_id")
+            if not session_id:
+                continue
+
+            ipc_dir = os.path.join(IPC_DIR, session_id)
+            instruction_file = os.path.join(ipc_dir, "queued_instruction.json")
+
+            if os.path.isfile(instruction_file):
+                try:
+                    with open(instruction_file) as f:
+                        data = json.load(f)
+                    instruction = data.get("instruction", "").strip()
+
+                    if instruction:
+                        # Display to user
+                        print(f"\n📱 **Telegram Instruction:**\n```\n{instruction}\n```\n")
+
+                        # Clear instruction
+                        try:
+                            os.remove(instruction_file)
+                            log.info(f"[TELEGRAM] Delivered instruction from session {session_id[:8]}")
+                        except:
+                            pass
+                        return True
+                except:
+                    pass
+    except:
+        pass
+
+    return False
+
+
 # ─── Setup ───────────────────────────────────────────────────────────────────
 
 def cmd_setup():
@@ -1005,6 +1051,9 @@ def _poll_response(ipc_dir, event_id, timeout):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Always check for pending Telegram instructions first (active listening)
+    check_pending_telegram_instructions()
+
     if len(sys.argv) < 2:
         print("Usage: hook.py <activate|deactivate|status|setup|respond|hook>", file=sys.stderr)
         sys.exit(1)
