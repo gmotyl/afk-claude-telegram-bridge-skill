@@ -162,6 +162,65 @@ export const deleteEventFile = (eventFile: string): TE.TaskEither<IpcError, void
  *   console.log(result.right) // ['event-S1.jsonl', 'event-S2.jsonl']
  * }
  */
+/**
+ * Response file structure for hook stop requests.
+ */
+export interface StopResponse {
+  readonly instruction: string
+}
+
+/**
+ * Write a response file for a stop event.
+ * The hook polls for this file to receive the next instruction.
+ *
+ * @param ipcDir - Path to the IPC directory
+ * @param eventId - The event ID from the stop event
+ * @param response - The response containing the instruction
+ * @returns TaskEither<IpcError, void>
+ */
+export const writeResponse = (
+  ipcDir: string,
+  eventId: string,
+  response: StopResponse
+): TE.TaskEither<IpcError, void> => {
+  const responsePath = `${ipcDir}/response-${eventId}.json`
+  return TE.tryCatch(
+    async () => {
+      await fs.writeFile(responsePath, JSON.stringify(response), 'utf-8')
+    },
+    writeErrorHandler(responsePath)
+  )
+}
+
+/**
+ * Read a response file for a stop event.
+ * Returns null if the file does not exist.
+ *
+ * @param ipcDir - Path to the IPC directory
+ * @param eventId - The event ID to look up
+ * @returns TaskEither<IpcError, StopResponse | null>
+ */
+export const readResponse = (
+  ipcDir: string,
+  eventId: string
+): TE.TaskEither<IpcError, StopResponse | null> => {
+  const responsePath = `${ipcDir}/response-${eventId}.json`
+  return TE.tryCatch(
+    async () => {
+      try {
+        const content = await fs.readFile(responsePath, 'utf-8')
+        return JSON.parse(content) as StopResponse
+      } catch (error: unknown) {
+        if (typeof error === 'object' && error !== null && 'code' in error && (error as { code: string }).code === 'ENOENT') {
+          return null
+        }
+        throw error
+      }
+    },
+    readErrorHandler(responsePath)
+  )
+}
+
 export const listEvents = (eventsDir: string): TE.TaskEither<IpcError, string[]> => {
   return TE.tryCatch(
     async () => {

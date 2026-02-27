@@ -4,6 +4,8 @@ export type IpcEvent =
   | { readonly _tag: 'Heartbeat'; readonly slotNum: number }
   | { readonly _tag: 'Message'; readonly text: string; readonly slotNum: number }
   | { readonly _tag: 'PermissionRequest'; readonly requestId: string; readonly tool: string; readonly command: string }
+  | { readonly _tag: 'Stop'; readonly eventId: string; readonly slotNum: number; readonly lastMessage: string; readonly stopHookActive: boolean; readonly timestamp: string }
+  | { readonly _tag: 'KeepAlive'; readonly eventId: string; readonly originalEventId: string; readonly slotNum: number; readonly timestamp: string }
 
 // Smart constructors
 export const sessionStart = (slotNum: number, projectName: string): IpcEvent =>
@@ -20,3 +22,9 @@ export const message = (text: string, slotNum: number): IpcEvent =>
 
 export const permissionRequest = (requestId: string, tool: string, command: string): IpcEvent =>
   ({ _tag: 'PermissionRequest', requestId, tool, command })
+
+export const stopEvent = (eventId: string, slotNum: number, lastMessage: string): IpcEvent =>
+  ({ _tag: 'Stop', eventId, slotNum, lastMessage, stopHookActive: true, timestamp: new Date().toISOString() })
+
+export const keepAlive = (eventId: string, originalEventId: string, slotNum: number): IpcEvent =>
+  ({ _tag: 'KeepAlive', eventId, slotNum, originalEventId, timestamp: new Date().toISOString() })

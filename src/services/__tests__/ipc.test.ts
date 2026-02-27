@@ -13,13 +13,17 @@ import {
   readEventQueue,
   writeEvent,
   deleteEventFile,
-  listEvents
+  listEvents,
+  writeResponse,
+  readResponse
 } from '../ipc'
 import {
   sessionStart,
   heartbeat,
   message,
-  sessionEnd
+  sessionEnd,
+  stopEvent,
+  keepAlive
 } from '../../types/events'
 
 describe('IPC Event Queue Module', () => {
@@ -456,6 +460,97 @@ describe('IPC Event Queue Module', () => {
       if (E.isRight(result)) {
         const files = result.right as string[]
         expect(files).toEqual(['a.jsonl', 'm.jsonl', 'z.jsonl'])
+      }
+    })
+  })
+
+  describe('writeResponse', () => {
+    it('writes a response file with instruction', async () => {
+      const result = await writeResponse(tempDir, 'evt-123', { instruction: 'run tests' })()
+
+      expect(E.isRight(result)).toBe(true)
+      const content = await fs.readFile(path.join(tempDir, 'response-evt-123.json'), 'utf-8')
+      const parsed = JSON.parse(content)
+      expect(parsed.instruction).toBe('run tests')
+    })
+
+    it('returns Left error for invalid directory', async () => {
+      const result = await writeResponse('/nonexistent/dir', 'evt-1', { instruction: 'test' })()
+
+      expect(E.isLeft(result)).toBe(true)
+      if (E.isLeft(result)) {
+        expect(result.left._tag).toBe('IpcWriteError')
+      }
+    })
+  })
+
+  describe('readResponse', () => {
+    it('reads an existing response file', async () => {
+      await fs.writeFile(
+        path.join(tempDir, 'response-evt-456.json'),
+        JSON.stringify({ instruction: 'deploy' }),
+        'utf-8'
+      )
+
+      const result = await readResponse(tempDir, 'evt-456')()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        expect(result.right).toEqual({ instruction: 'deploy' })
+      }
+    })
+
+    it('returns null when response file does not exist', async () => {
+      const result = await readResponse(tempDir, 'nonexistent')()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        expect(result.right).toBeNull()
+      }
+    })
+
+    it('returns Left error for malformed JSON', async () => {
+      await fs.writeFile(
+        path.join(tempDir, 'response-evt-bad.json'),
+        'not json',
+        'utf-8'
+      )
+
+      const result = await readResponse(tempDir, 'evt-bad')()
+
+      expect(E.isLeft(result)).toBe(true)
+      if (E.isLeft(result)) {
+        expect(result.left._tag).toBe('IpcParseError')
+      }
+    })
+  })
+
+  describe('Stop and KeepAlive events through IPC', () => {
+    it('writes and reads Stop event via JSONL', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      const event = stopEvent('evt-1', 1, 'last message')
+
+      await writeEvent(eventsFile, event)()
+      const result = await readEventQueue(eventsFile)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        expect(result.right).toHaveLength(1)
+        expect(result.right[0]!._tag).toBe('Stop')
+      }
+    })
+
+    it('writes and reads KeepAlive event via JSONL', async () => {
+      const eventsFile = path.join(tempDir, 'events.jsonl')
+      const event = keepAlive('ka-1', 'evt-1', 2)
+
+      await writeEvent(eventsFile, event)()
+      const result = await readEventQueue(eventsFile)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        expect(result.right).toHaveLength(1)
+        expect(result.right[0]!._tag).toBe('KeepAlive')
       }
     })
   })

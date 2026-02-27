@@ -1,5 +1,5 @@
 import * as E from 'fp-ts/Either'
-import { State, Slot } from '../../types/state'
+import { State, Slot, PendingStop } from '../../types/state'
 
 export type StateError =
   | { readonly _tag: 'SlotAlreadyActive'; readonly slotNum: number }
@@ -40,6 +40,7 @@ export const addSlot = (
 
   // Create new state (immutable)
   return E.right({
+    ...state,
     slots: {
       ...state.slots,
       [slotNum]: slot
@@ -52,6 +53,7 @@ export const addSlot = (
  * Always succeeds (idempotent)
  */
 export const removeSlot = (state: State, slotNum: number): State => ({
+  ...state,
   slots: {
     ...state.slots,
     [slotNum]: undefined
@@ -72,6 +74,7 @@ export const heartbeatSlot = (
   }
 
   return E.right({
+    ...state,
     slots: {
       ...state.slots,
       [slotNum]: {
@@ -97,5 +100,51 @@ export const cleanupStaleSlots = (
     cleaned[slotNum] = isSlotActive(slot, timeoutMs, now) ? slot : undefined
   })
 
-  return { slots: cleaned }
+  return { ...state, slots: cleaned }
+}
+
+/**
+ * Add a pending stop to state
+ */
+export const addPendingStop = (state: State, pendingStop: PendingStop): State => ({
+  ...state,
+  pendingStops: {
+    ...state.pendingStops,
+    [pendingStop.eventId]: pendingStop
+  }
+})
+
+/**
+ * Remove a pending stop from state by eventId
+ */
+export const removePendingStop = (state: State, eventId: string): State => {
+  const { [eventId]: _, ...rest } = state.pendingStops
+  return { ...state, pendingStops: rest }
+}
+
+/**
+ * Find a pending stop by slot number
+ * Returns the first pending stop for this slot, or undefined
+ */
+export const findPendingStopBySlot = (state: State, slotNum: number): PendingStop | undefined => {
+  return Object.values(state.pendingStops).find(ps => ps.slotNum === slotNum)
+}
+
+/**
+ * Update the Telegram message ID on a pending stop
+ */
+export const updatePendingStopMessageId = (
+  state: State,
+  eventId: string,
+  telegramMessageId: number
+): State => {
+  const existing = state.pendingStops[eventId]
+  if (!existing) return state
+  return {
+    ...state,
+    pendingStops: {
+      ...state.pendingStops,
+      [eventId]: { ...existing, telegramMessageId }
+    }
+  }
 }

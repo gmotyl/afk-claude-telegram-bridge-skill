@@ -45,7 +45,8 @@ describe('State Persistence Module', () => {
           2: undefined,
           3: undefined,
           4: undefined
-        }
+        },
+        pendingStops: {}
       }
       await fs.writeFile(stateFile, JSON.stringify(testState), 'utf-8')
 
@@ -132,7 +133,8 @@ describe('State Persistence Module', () => {
           },
           3: undefined,
           4: undefined
-        }
+        },
+        pendingStops: {}
       }
       await fs.writeFile(stateFile, JSON.stringify(testState), 'utf-8')
 
@@ -146,6 +148,22 @@ describe('State Persistence Module', () => {
         expect(state.slots[2]?.projectName).toBe('alokai')
         expect(state.slots[2]?.activatedAt).toBe(activatedAt2.toISOString())
         expect(state.slots[3]).toBeUndefined()
+      }
+    })
+
+    it('defaults pendingStops when loading old state format', async () => {
+      const stateFile = path.join(tempDir, 'state.json')
+      // Old format: no pendingStops field
+      const oldFormatState = {
+        slots: { 1: undefined, 2: undefined, 3: undefined, 4: undefined }
+      }
+      await fs.writeFile(stateFile, JSON.stringify(oldFormatState), 'utf-8')
+
+      const result = await loadState(stateFile)()
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        expect(result.right.pendingStops).toEqual({})
       }
     })
 
@@ -176,7 +194,8 @@ describe('State Persistence Module', () => {
           2: undefined,
           3: undefined,
           4: undefined
-        }
+        },
+        pendingStops: {}
       }
 
       const result = await saveState(stateFile, testState)()
@@ -199,7 +218,8 @@ describe('State Persistence Module', () => {
           2: undefined,
           3: undefined,
           4: undefined
-        }
+        },
+        pendingStops: {}
       }
       await fs.writeFile(stateFile, JSON.stringify(oldState), 'utf-8')
 
@@ -213,7 +233,8 @@ describe('State Persistence Module', () => {
           2: undefined,
           3: undefined,
           4: undefined
-        }
+        },
+        pendingStops: {}
       }
       const result = await saveState(stateFile, newState)()
 
@@ -277,7 +298,8 @@ describe('State Persistence Module', () => {
           2: undefined,
           3: undefined,
           4: undefined
-        }
+        },
+        pendingStops: {}
       }
 
       const result = await saveState(stateFile, testState)()
@@ -318,7 +340,8 @@ describe('State Persistence Module', () => {
           2: undefined,
           3: undefined,
           4: undefined
-        }
+        },
+        pendingStops: {}
       }
 
       // Save the state
@@ -348,7 +371,8 @@ describe('State Persistence Module', () => {
           2: undefined,
           3: undefined,
           4: undefined
-        }
+        },
+        pendingStops: {}
       }
       await saveState(stateFile, state1)()
 
@@ -363,7 +387,8 @@ describe('State Persistence Module', () => {
           },
           3: undefined,
           4: undefined
-        }
+        },
+        pendingStops: {}
       }
       await saveState(stateFile, state2)()
 

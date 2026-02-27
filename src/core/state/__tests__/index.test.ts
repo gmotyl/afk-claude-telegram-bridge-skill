@@ -1,5 +1,5 @@
-import { isSlotActive, addSlot, removeSlot, heartbeatSlot, cleanupStaleSlots, StateError } from '../index'
-import { State, Slot, initialState } from '../../../types/state'
+import { isSlotActive, addSlot, removeSlot, heartbeatSlot, cleanupStaleSlots, addPendingStop, removePendingStop, findPendingStopBySlot, updatePendingStopMessageId, StateError } from '../index'
+import { State, Slot, PendingStop, initialState } from '../../../types/state'
 import * as E from 'fp-ts/Either'
 
 const now = new Date('2024-01-01T12:00:00Z')
@@ -307,5 +307,74 @@ describe('cleanupStaleSlots', () => {
 
     expect(result.slots[1]).toBeDefined()
     expect(result.slots[3]).toBeDefined()
+  })
+})
+
+describe('addPendingStop', () => {
+  const ps: PendingStop = {
+    eventId: 'evt-1',
+    slotNum: 1,
+    lastMessage: 'test',
+    timestamp: '2026-01-01T00:00:00.000Z'
+  }
+
+  it('adds a pending stop to state', () => {
+    const result = addPendingStop(initialState, ps)
+    expect(result.pendingStops['evt-1']).toEqual(ps)
+  })
+
+  it('preserves existing pending stops', () => {
+    const ps2: PendingStop = { eventId: 'evt-2', slotNum: 2, lastMessage: 'x', timestamp: '2026-01-01T00:00:00.000Z' }
+    const state1 = addPendingStop(initialState, ps)
+    const state2 = addPendingStop(state1, ps2)
+    expect(state2.pendingStops['evt-1']).toEqual(ps)
+    expect(state2.pendingStops['evt-2']).toEqual(ps2)
+  })
+
+  it('preserves slots', () => {
+    const result = addPendingStop(initialState, ps)
+    expect(result.slots).toEqual(initialState.slots)
+  })
+})
+
+describe('removePendingStop', () => {
+  it('removes a pending stop by eventId', () => {
+    const ps: PendingStop = { eventId: 'evt-1', slotNum: 1, lastMessage: 'test', timestamp: '2026-01-01T00:00:00.000Z' }
+    const state1 = addPendingStop(initialState, ps)
+    const state2 = removePendingStop(state1, 'evt-1')
+    expect(state2.pendingStops['evt-1']).toBeUndefined()
+  })
+
+  it('is idempotent', () => {
+    const state1 = removePendingStop(initialState, 'nonexistent')
+    expect(state1.pendingStops).toEqual({})
+  })
+})
+
+describe('findPendingStopBySlot', () => {
+  it('finds pending stop by slot number', () => {
+    const ps: PendingStop = { eventId: 'evt-1', slotNum: 2, lastMessage: 'test', timestamp: '2026-01-01T00:00:00.000Z' }
+    const state = addPendingStop(initialState, ps)
+    const found = findPendingStopBySlot(state, 2)
+    expect(found).toEqual(ps)
+  })
+
+  it('returns undefined when no pending stop for slot', () => {
+    const found = findPendingStopBySlot(initialState, 1)
+    expect(found).toBeUndefined()
+  })
+})
+
+describe('updatePendingStopMessageId', () => {
+  it('updates telegramMessageId on a pending stop', () => {
+    const ps: PendingStop = { eventId: 'evt-1', slotNum: 1, lastMessage: 'test', timestamp: '2026-01-01T00:00:00.000Z' }
+    const state1 = addPendingStop(initialState, ps)
+    const state2 = updatePendingStopMessageId(state1, 'evt-1', 42)
+    expect(state2.pendingStops['evt-1']?.telegramMessageId).toBe(42)
+  })
+
+  it('returns state unchanged if eventId not found', () => {
+    const result = updatePendingStopMessageId(initialState, 'nonexistent', 42)
+    expect(result).toEqual(initialState)
   })
 })

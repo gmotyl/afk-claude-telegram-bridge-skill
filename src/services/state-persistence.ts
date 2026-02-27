@@ -73,8 +73,12 @@ export const loadState = (stateFile: string): TE.TaskEither<StateError, State> =
 
         // Parse content as JSON
         try {
-          const parsed = JSON.parse(content) as State
-          return parsed
+          const parsed = JSON.parse(content) as Record<string, unknown>
+          // Default missing pendingStops for backwards compatibility with old state files
+          if (!('pendingStops' in parsed) || parsed['pendingStops'] === undefined) {
+            (parsed as Record<string, unknown>)['pendingStops'] = {}
+          }
+          return parsed as unknown as State
         } catch (parseError) {
           // Re-throw JSON parse errors to be caught by outer try-catch
           throw parseError
