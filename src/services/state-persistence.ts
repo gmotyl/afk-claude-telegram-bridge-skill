@@ -78,6 +78,29 @@ export const loadState = (stateFile: string): TE.TaskEither<StateError, State> =
           if (!('pendingStops' in parsed) || parsed['pendingStops'] === undefined) {
             (parsed as Record<string, unknown>)['pendingStops'] = {}
           }
+          // Normalize legacy Python slot format
+          const slots = parsed['slots'] as Record<string, unknown> | undefined
+          if (slots) {
+            for (const [key, slot] of Object.entries(slots)) {
+              if (slot && typeof slot === 'object') {
+                const s = slot as Record<string, unknown>
+                // Migrate Python field names
+                if ('session_id' in s && !('sessionId' in s)) s['sessionId'] = s['session_id']
+                if ('project' in s && !('projectName' in s)) s['projectName'] = s['project']
+                if ('topic_name' in s && !('topicName' in s)) s['topicName'] = s['topic_name']
+                if ('thread_id' in s && !('threadId' in s)) s['threadId'] = s['thread_id']
+                // Migrate date fields
+                if ('started' in s && !('activatedAt' in s)) {
+                  s['activatedAt'] = new Date(String(s['started']))
+                  s['lastHeartbeat'] = new Date(String(s['started']))
+                }
+                // Ensure dates are Date objects
+                if (typeof s['activatedAt'] === 'string') s['activatedAt'] = new Date(s['activatedAt'] as string)
+                if (typeof s['lastHeartbeat'] === 'string') s['lastHeartbeat'] = new Date(s['lastHeartbeat'] as string)
+                slots[key] = s
+              }
+            }
+          }
           return parsed as unknown as State
         } catch (parseError) {
           // Re-throw JSON parse errors to be caught by outer try-catch

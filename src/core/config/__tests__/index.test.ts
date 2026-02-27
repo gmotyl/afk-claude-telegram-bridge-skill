@@ -106,36 +106,40 @@ describe('loadConfig', () => {
     expect(E.isLeft(result)).toBe(true)
   })
 
-  it('validates that config has ipcBaseDir field', () => {
+  it('provides default ipcBaseDir when missing', () => {
     const configPath = path.join(tmpDir, 'missing-ipcdir.json')
     const incompleteConfig = {
       telegramBotToken: 'token',
       telegramGroupId: 12345,
       sessionTimeout: 300000
-      // missing ipcBaseDir
     }
 
     fs.writeFileSync(configPath, JSON.stringify(incompleteConfig))
 
     const result = loadConfig(configPath)
 
-    expect(E.isLeft(result)).toBe(true)
+    expect(E.isRight(result)).toBe(true)
+    if (E.isRight(result)) {
+      expect(result.right.ipcBaseDir).toBe(path.join(tmpDir, 'ipc'))
+    }
   })
 
-  it('validates that config has sessionTimeout field', () => {
+  it('provides default sessionTimeout when missing', () => {
     const configPath = path.join(tmpDir, 'missing-timeout.json')
     const incompleteConfig = {
       telegramBotToken: 'token',
       telegramGroupId: 12345,
       ipcBaseDir: '/tmp/ipc'
-      // missing sessionTimeout
     }
 
     fs.writeFileSync(configPath, JSON.stringify(incompleteConfig))
 
     const result = loadConfig(configPath)
 
-    expect(E.isLeft(result)).toBe(true)
+    expect(E.isRight(result)).toBe(true)
+    if (E.isRight(result)) {
+      expect(result.right.sessionTimeout).toBe(900000)
+    }
   })
 
   it('validates field types - telegramBotToken must be string', () => {

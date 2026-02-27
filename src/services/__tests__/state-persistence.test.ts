@@ -150,9 +150,9 @@ describe('State Persistence Module', () => {
       if (E.isRight(result)) {
         const state = result.right
         expect(state.slots[1]?.projectName).toBe('metro')
-        expect(state.slots[1]?.activatedAt).toBe(activatedAt1.toISOString())
+        expect(state.slots[1]?.activatedAt).toEqual(activatedAt1)
         expect(state.slots[2]?.projectName).toBe('alokai')
-        expect(state.slots[2]?.activatedAt).toBe(activatedAt2.toISOString())
+        expect(state.slots[2]?.activatedAt).toEqual(activatedAt2)
         expect(state.slots[3]).toBeUndefined()
       }
     })

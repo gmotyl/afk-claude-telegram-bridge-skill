@@ -71,14 +71,45 @@ const isValidConfig = (value: unknown): value is Config => {
  * @param configPath - Path to the config.json file
  * @returns Either<Error, Config> - Left(error) or Right(config)
  */
+/**
+ * Normalize legacy Python-format config to TS format.
+ * Handles: bot_token → telegramBotToken, chat_id → telegramGroupId
+ * Fills in defaults for ipcBaseDir and sessionTimeout if missing.
+ */
+const normalizeConfig = (obj: Record<string, unknown>, configPath: string): Record<string, unknown> => {
+  const result = { ...obj }
+
+  // Migrate Python field names
+  if ('bot_token' in result && !('telegramBotToken' in result)) {
+    result['telegramBotToken'] = result['bot_token']
+  }
+  if ('chat_id' in result && !('telegramGroupId' in result)) {
+    const chatId = result['chat_id']
+    result['telegramGroupId'] = typeof chatId === 'string' ? parseInt(chatId, 10) : chatId
+  }
+
+  // Default ipcBaseDir to sibling ipc/ directory
+  if (!('ipcBaseDir' in result)) {
+    result['ipcBaseDir'] = path.join(path.dirname(configPath), 'ipc')
+  }
+
+  // Default sessionTimeout to 15 minutes
+  if (!('sessionTimeout' in result)) {
+    result['sessionTimeout'] = 900000
+  }
+
+  return result
+}
+
 export const loadConfig = (configPath: string): E.Either<Error, Config> => {
   return E.tryCatch(
     () => {
       // Read file from filesystem
       const content = fs.readFileSync(configPath, 'utf-8')
 
-      // Parse JSON
-      const parsed = JSON.parse(content)
+      // Parse JSON and normalize legacy format
+      const raw = JSON.parse(content) as Record<string, unknown>
+      const parsed = normalizeConfig(raw, configPath)
 
       // Validate structure
       if (!isValidConfig(parsed)) {
