@@ -37,5 +37,20 @@ await Promise.all([
       fs.writeFileSync(bridgePath, content)
     }
   }),
+  esbuild.build({
+    entryPoints: ['src/cli/index.ts'],
+    bundle: true,
+    minify: true,
+    platform: 'node',
+    target: 'node18',
+    outfile: 'dist/cli.js',
+  }).then(() => {
+    const cliPath = 'dist/cli.js'
+    let content = fs.readFileSync(cliPath, 'utf8')
+    if (!content.startsWith('#!/usr/bin/env node')) {
+      content = '#!/usr/bin/env node\n' + content
+      fs.writeFileSync(cliPath, content)
+    }
+  }),
 ])
 console.log('Build complete')

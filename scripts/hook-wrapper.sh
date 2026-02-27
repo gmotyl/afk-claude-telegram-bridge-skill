@@ -45,30 +45,41 @@ case "${1:-}" in
     fi
     exit 0
     ;;
+  --activate)
+    # Activate AFK mode: claim slot, create IPC dir, start daemon
+    shift
+    exec node "$CONFIG_DIR/cli.js" activate "$@"
+    ;;
+  --deactivate)
+    # Deactivate AFK mode: release slot, clean IPC, stop daemon if last
+    shift
+    exec node "$CONFIG_DIR/cli.js" deactivate "$@"
+    ;;
   --setup)
-    # Placeholder for setup operations
-    # Future: interactive config setup
-    echo "Setup mode not yet implemented" >&2
-    exit 1
+    # Interactive bot token + chat_id configuration
+    if [ -f "$CONFIG_DIR/hook.py" ]; then
+      exec python3 "$CONFIG_DIR/hook.py" setup
+    else
+      echo "Setup mode not yet implemented" >&2
+      exit 1
+    fi
     ;;
   --help|-h)
     cat <<'EOF'
-Usage: hook.sh [--status|--setup|--help] [hook-type]
+Usage: hook.sh [--activate|--deactivate|--status|--setup|--help] [hook-type]
 
 Wrapper for TypeScript telegram-bridge hook.
 
-Options:
+Commands:
+  --activate <session_id> <project> [topic]  Activate AFK mode
+  --deactivate <session_id>                  Deactivate AFK mode
   --status      Show daemon status
-  --setup       Configure Telegram credentials (placeholder)
+  --setup       Configure Telegram credentials
   --help        Show this help message
 
 Hook Types (when called without --flags):
-  permission_request  Handle permission requests
-  stop                Handle stop requests
-  notification        Handle notifications
-
-When called without arguments, reads JSON from stdin and processes
-the hook event based on the hook type specified in the JSON.
+  Reads JSON from stdin (Claude Code hook event) and processes
+  permission_request, stop, or notification events.
 
 Environment:
   TELEGRAM_BRIDGE_CONFIG  Set to config directory
