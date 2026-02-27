@@ -7,3 +7,4 @@ __pycache__/
 node_modules/
 coverage/
 # dist/ is committed (compiled output for npx distribution)
+.worktrees/
