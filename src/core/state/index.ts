@@ -93,16 +93,14 @@ export const cleanupStaleSlots = (
   timeoutMs: number,
   now: Date
 ): State => {
-  const cleaned: Record<number, Slot | undefined> = {}
-
-  Object.entries(state.slots).forEach(([key, slot]) => {
+  const newSlots: Record<number, Slot | undefined> = { 1: undefined, 2: undefined, 3: undefined, 4: undefined }
+  for (let i = 1; i <= 4; i++) {
+    const slot = state.slots[i]
     if (slot && isSlotActive(slot, timeoutMs, now)) {
-      const slotNum = parseInt(key, 10)
-      cleaned[slotNum] = slot
+      newSlots[i] = slot
     }
-  })
-
-  return { ...state, slots: cleaned }
+  }
+  return { ...state, slots: newSlots }
 }
 
 /**

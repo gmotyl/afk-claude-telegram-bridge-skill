@@ -89,8 +89,17 @@ case "${1:-}" in
       fi
     fi
 
-    # Kill all bridge.js daemon processes
-    pkill -f "node.*bridge\.js" 2>/dev/null && echo "Killed daemon processes" || echo "No daemons running"
+    # Kill daemon by PID from state.json (avoids killing unrelated node processes)
+    if [ -f "$CONFIG_DIR/state.json" ]; then
+      DAEMON_PID=$(node -e 'try { const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf-8")); if (s.daemon_pid) console.log(s.daemon_pid); } catch(e) {}' "$CONFIG_DIR/state.json" 2>/dev/null)
+      if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+        kill "$DAEMON_PID" 2>/dev/null && echo "Killed daemon process (PID $DAEMON_PID)" || echo "Failed to kill daemon PID $DAEMON_PID"
+      else
+        echo "No daemon running (PID ${DAEMON_PID:-unknown})"
+      fi
+    else
+      echo "No state.json found, skipping daemon kill"
+    fi
     # Clear IPC directories
     if [ -d "$CONFIG_DIR/ipc" ]; then
       rm -rf "$CONFIG_DIR/ipc"
