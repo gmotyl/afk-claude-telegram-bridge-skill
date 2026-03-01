@@ -11,6 +11,7 @@ export interface Slot {
 export interface PendingStop {
   readonly eventId: string
   readonly slotNum: number
+  readonly sessionId?: string
   readonly lastMessage: string
   readonly timestamp: string
   readonly telegramMessageId?: number

@@ -72,7 +72,7 @@ export const requestPermission = (
       const eventsFile = path.join(sessionIpcDir, 'events.jsonl')
 
       const commandDisplay = hookArgs.command || hookArgs.tool
-      const event = permissionRequest(requestId, hookArgs.tool, commandDisplay, slotNum)
+      const event = permissionRequest(requestId, hookArgs.tool, commandDisplay, slotNum, sessionId)
 
       const writeResult = await writeEvent(eventsFile, event)()
       if (!('right' in writeResult)) {

@@ -160,6 +160,37 @@ describe('Stop Hook Handler', () => {
       }
     })
 
+    it('does NOT delete bound_session file (prevents session hijacking)', async () => {
+      // Create a bound_session file
+      const boundSessionFile = path.join(sessionDir, 'bound_session')
+      await fs.writeFile(boundSessionFile, 'claude-session-123', 'utf-8')
+
+      const responsePromise = writeResponseAfterDelay(100, 'test instruction')
+
+      await handleStopRequest(ipcBaseDir, sessionId, slotNum, 'done')()
+      await responsePromise
+
+      // bound_session must still exist — deleting it causes session hijacking
+      const exists = await fs.access(boundSessionFile).then(() => true).catch(() => false)
+      expect(exists).toBe(true)
+      const content = await fs.readFile(boundSessionFile, 'utf-8')
+      expect(content).toBe('claude-session-123')
+    })
+
+    it('includes sessionId in Stop event for daemon cross-validation', async () => {
+      const responsePromise = writeResponseAfterDelay(100, 'test')
+
+      await handleStopRequest(ipcBaseDir, sessionId, slotNum, 'last msg')()
+      await responsePromise
+
+      const eventsFile = path.join(sessionDir, 'events.jsonl')
+      const content = await fs.readFile(eventsFile, 'utf-8')
+      const lines = content.split('\n').filter(l => l.trim())
+      const firstEvent = JSON.parse(lines[0]!) as { _tag: string; sessionId?: string }
+      expect(firstEvent._tag).toBe('Stop')
+      expect(firstEvent.sessionId).toBe(sessionId)
+    })
+
     it('returns Left error when session IPC directory does not exist', async () => {
       const result = await handleStopRequest(ipcBaseDir, 'nonexistent-session', slotNum, 'done')()
 

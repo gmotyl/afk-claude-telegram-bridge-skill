@@ -89,8 +89,8 @@ export const handleStopRequest = (
       const sessionIpcDir = path.join(ipcBaseDir, sessionId)
       const eventsFile = path.join(sessionIpcDir, 'events.jsonl')
 
-      // Write Stop event to IPC
-      const event = stopEvent(eventId, slotNum, lastMessage)
+      // Write Stop event to IPC (include sessionId for daemon cross-validation)
+      const event = stopEvent(eventId, slotNum, lastMessage, sessionId)
       console.error(`[stop-hook] Writing Stop event ${eventId.slice(0,8)} to ${eventsFile}`)
       const writeResult = await writeEvent(eventsFile, event)()
       if (E.isLeft(writeResult)) {
@@ -99,7 +99,7 @@ export const handleStopRequest = (
 
       // Enter polling loop
       console.error(`[stop-hook] Entering polling loop for response-${eventId.slice(0,8)}.json in ${sessionIpcDir}`)
-      return await pollForInstruction(sessionIpcDir, eventId, slotNum, eventsFile, configDir)
+      return await pollForInstruction(sessionIpcDir, eventId, slotNum, eventsFile, configDir, sessionId)
     },
     (error: unknown): HookError => {
       if (typeof error === 'object' && error !== null && '_tag' in error) {
@@ -185,7 +185,8 @@ const pollForInstruction = async (
   eventId: string,
   slotNum: number,
   eventsFile: string,
-  configDir?: string
+  configDir?: string,
+  sessionId?: string
 ): Promise<StopDecision> => {
   let pollIntervalMs = INITIAL_POLL_MS
   let lastKeepAlive = Date.now()
@@ -214,10 +215,10 @@ const pollForInstruction = async (
       const responseFile = path.join(ipcDir, `response-${eventId}.json`)
       await fs.unlink(responseFile).catch(() => {})
 
-      // Clear bound_session so the next hook call (which may have a new
-      // session_id from Claude Code) can rebind to this slot.
-      const boundSessionFile = path.join(ipcDir, 'bound_session')
-      await fs.unlink(boundSessionFile).catch(() => {})
+      // NOTE: Do NOT delete bound_session here. The binding must persist
+      // for the session's entire lifetime. Deleting it creates a race
+      // condition where another session's hook can rebind to this slot
+      // via findUnboundSession(), causing session hijacking.
 
       // Block stop and inject instruction via "reason" field
       // (matches Claude Code Stop hook schema)
@@ -265,7 +266,7 @@ const pollForInstruction = async (
     // Send keep-alive if interval elapsed
     if (now - lastKeepAlive >= KEEP_ALIVE_INTERVAL_MS) {
       const kaEventId = randomUUID()
-      const kaEvent = keepAlive(kaEventId, eventId, slotNum)
+      const kaEvent = keepAlive(kaEventId, eventId, slotNum, sessionId)
       await writeEvent(eventsFile, kaEvent)()
       lastKeepAlive = now
     }

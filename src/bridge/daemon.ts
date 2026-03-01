@@ -124,6 +124,7 @@ const processEvent = (
       const pendingStop: PendingStop = {
         eventId: event.eventId,
         slotNum: event.slotNum,
+        ...(event.sessionId ? { sessionId: event.sessionId } : {}),
         lastMessage: event.lastMessage,
         timestamp: event.timestamp
       }
@@ -306,6 +307,7 @@ const processAllEvents = (
 
       for (const dir of sessionDirs) {
         const sessionDir = path.join(config.ipcBaseDir, dir.name)
+        const dirSessionId = dir.name  // IPC directory name IS the session UUID
 
         const filesResult = await listEvents(sessionDir)()
         if (E.isLeft(filesResult)) continue
@@ -318,6 +320,15 @@ const processAllEvents = (
           const eventsResult = await readEventQueue(filePath)()
           if (E.isRight(eventsResult)) {
             for (const event of eventsResult.right) {
+              // Cross-validate: if event has sessionId, it must match the directory
+              if ('sessionId' in event && event.sessionId && event.sessionId !== dirSessionId) {
+                // SessionStart is special — its sessionId IS the AFK UUID, which matches dir
+                if (event._tag !== 'SessionStart') {
+                  console.error(`[daemon] SESSION MISMATCH: event.sessionId=${(event.sessionId as string).slice(0,8)} != dir=${dirSessionId.slice(0,8)}, dropping ${event._tag} event`)
+                  continue
+                }
+              }
+
               // Save pre-event state for SessionEnd side effects
               const preEventState = currentState
 
@@ -635,8 +646,17 @@ const processIncomingMessage = async (
   const sessionIpcDir = getSessionIpcDir(config, state, slotNum)
   const pendingStop = findPendingStopBySlot(state, slotNum)
 
-  const allPS = Object.values(state.pendingStops).map(ps => ({ eventId: ps.eventId.slice(0,8), slotNum: ps.slotNum, slotNumType: typeof ps.slotNum }))
-  console.log(`[telegram] processIncomingMessage slot=${slotNum}(${typeof slotNum}), pendingStops=${JSON.stringify(allPS)}, found=${!!pendingStop}`)
+  const slot = state.slots[slotNum]
+  const allPS = Object.values(state.pendingStops).map(ps => ({ eventId: ps.eventId.slice(0,8), slotNum: ps.slotNum, sessionId: ps.sessionId?.slice(0,8) }))
+  console.log(`[telegram] processIncomingMessage slot=${slotNum}, pendingStops=${JSON.stringify(allPS)}, found=${!!pendingStop}`)
+
+  // Validate pending stop belongs to this slot's session
+  if (pendingStop && pendingStop.sessionId && slot?.sessionId && pendingStop.sessionId !== slot.sessionId) {
+    console.error(`[telegram] PENDING STOP SESSION MISMATCH: pendingStop.sessionId=${pendingStop.sessionId.slice(0,8)} != slot.sessionId=${slot.sessionId.slice(0,8)}, skipping`)
+    // Remove the mismatched pending stop
+    return removePendingStop(state, pendingStop.eventId)
+  }
+
   if (pendingStop) {
     console.log(`[telegram] Delivering instruction to slot ${slotNum}, eventId=${pendingStop.eventId.slice(0,8)}: "${text.slice(0,50)}"`)
     const writeResult = await writeResponse(sessionIpcDir, pendingStop.eventId, {
@@ -646,7 +666,6 @@ const processIncomingMessage = async (
     if (E.isRight(writeResult)) {
       startTyping(runtime, slotNum)
       // Verbose: confirm delivery in topic
-      const slot = state.slots[slotNum]
       if (slot?.verbose && slot.threadId) {
         await sendMessageToTopic(
           config.telegramBotToken,
@@ -666,7 +685,6 @@ const processIncomingMessage = async (
   await writeQueuedInstruction(sessionIpcDir, text)()
 
   // Verbose: confirm queuing in topic
-  const slot = state.slots[slotNum]
   if (slot?.verbose && slot.threadId) {
     await sendMessageToTopic(
       config.telegramBotToken,
