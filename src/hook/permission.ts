@@ -74,6 +74,9 @@ export const requestPermission = (
       const commandDisplay = hookArgs.command || hookArgs.tool
       const event = permissionRequest(requestId, hookArgs.tool, commandDisplay, slotNum, sessionId)
 
+      // Ensure IPC directory exists (may be missing after /afk-reset)
+      await fs.mkdir(sessionIpcDir, { recursive: true })
+
       const writeResult = await writeEvent(eventsFile, event)()
       if (!('right' in writeResult)) {
         throw hookError(`Failed to write permission request to IPC: ${String((writeResult as any).left)}`)

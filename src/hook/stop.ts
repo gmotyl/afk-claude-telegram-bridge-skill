@@ -24,8 +24,7 @@ import { randomUUID } from 'crypto'
 import { stopEvent, keepAlive } from '../types/events'
 import { writeEvent } from '../services/ipc'
 import { readResponse, type StopResponse } from '../services/ipc'
-import { checkDaemonHealth, type DaemonHealthStatus } from '../services/daemon-health'
-import { startDaemon, isDaemonAlive } from '../services/daemon-launcher'
+import { checkDaemonHealth, ensureDaemonAlive } from '../services/daemon-health'
 import { type HookError, hookError } from '../types/errors'
 
 // ============================================================================
@@ -89,6 +88,9 @@ export const handleStopRequest = (
       const sessionIpcDir = path.join(ipcBaseDir, sessionId)
       const eventsFile = path.join(sessionIpcDir, 'events.jsonl')
 
+      // Ensure IPC directory exists (may be missing after /afk-reset)
+      await fs.mkdir(sessionIpcDir, { recursive: true })
+
       // Write Stop event to IPC (include sessionId for daemon cross-validation)
       const event = stopEvent(eventId, slotNum, lastMessage, sessionId)
       console.error(`[stop-hook] Writing Stop event ${eventId.slice(0,8)} to ${eventsFile}`)
@@ -117,7 +119,8 @@ export const handleStopRequest = (
 // ============================================================================
 
 /**
- * Attempt to recover a dead daemon by restarting it and re-sending the Stop event.
+ * Attempt to recover a dead daemon by restarting it (via shared helper)
+ * and re-sending the Stop event.
  *
  * @returns true if recovery succeeded, false if it failed
  */
@@ -131,21 +134,12 @@ const attemptDaemonRecovery = async (
 ): Promise<boolean> => {
   console.error(`[stop-hook] Daemon recovery attempt ${attemptNum}/${MAX_RECOVERY_ATTEMPTS}`)
 
-  const bridgePath = path.join(configDir, 'bridge.js')
-  const logPath = path.join(configDir, 'daemon.log')
+  const restarted = await ensureDaemonAlive(configDir)
 
-  const spawnResult = await startDaemon(bridgePath, configDir, logPath)()
-
-  if (E.isLeft(spawnResult)) {
-    console.error(`[stop-hook] Failed to restart daemon: ${String(spawnResult.left)}`)
+  if (!restarted) {
+    console.error(`[stop-hook] Failed to restart daemon`)
     return false
   }
-
-  const newPid = spawnResult.right
-  console.error(`[stop-hook] Daemon restarted with PID ${newPid}`)
-
-  // Update daemon PID in state.json
-  await updateDaemonPidInState(configDir, newPid)
 
   // Re-send the Stop event so the new daemon picks it up
   const event = stopEvent(eventId, slotNum, lastMessage)
@@ -158,22 +152,6 @@ const attemptDaemonRecovery = async (
 
   console.error(`[stop-hook] Re-sent Stop event ${eventId.slice(0,8)} after daemon recovery`)
   return true
-}
-
-/**
- * Update daemon_pid in state.json after a restart.
- */
-const updateDaemonPidInState = async (configDir: string, pid: number): Promise<void> => {
-  const statePath = path.join(configDir, 'state.json')
-  try {
-    const content = await fs.readFile(statePath, 'utf-8')
-    const state = JSON.parse(content) as Record<string, unknown>
-    state['daemon_pid'] = pid
-    state['daemon_heartbeat'] = Date.now() / 1000
-    await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf-8')
-  } catch (error) {
-    console.error(`[stop-hook] Failed to update daemon PID in state: ${String(error)}`)
-  }
 }
 
 // ============================================================================

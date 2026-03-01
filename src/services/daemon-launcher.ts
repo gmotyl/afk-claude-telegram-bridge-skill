@@ -6,7 +6,13 @@
 import * as TE from 'fp-ts/TaskEither'
 import { spawn } from 'child_process'
 import * as fs from 'fs/promises'
+import * as path from 'path'
 import { type DaemonSpawnError, type DaemonStopError, daemonSpawnError, daemonStopError } from '../types/errors'
+
+/** Max time to wait for daemon heartbeat after spawn (ms) */
+const SPAWN_VERIFY_TIMEOUT_MS = 5000
+/** Polling interval for heartbeat verification (ms) */
+const SPAWN_VERIFY_POLL_MS = 200
 
 /**
  * Start the bridge daemon as a detached background process.
@@ -24,6 +30,7 @@ export const startDaemon = (
 ): TE.TaskEither<DaemonSpawnError, number> =>
   TE.tryCatch(
     async () => {
+      const spawnTime = Date.now()
       const logFd = await fs.open(logPath, 'a')
       const child = spawn('node', [bridgePath], {
         detached: true,
@@ -38,6 +45,27 @@ export const startDaemon = (
 
       child.unref()
       await logFd.close()
+
+      // Verify daemon initialized by polling for a fresh heartbeat
+      const heartbeatPath = path.join(configPath, 'daemon.heartbeat')
+      const deadline = Date.now() + SPAWN_VERIFY_TIMEOUT_MS
+
+      while (Date.now() < deadline) {
+        try {
+          const content = await fs.readFile(heartbeatPath, 'utf-8')
+          const heartbeatTs = parseInt(content.trim(), 10)
+          if (!isNaN(heartbeatTs) && heartbeatTs >= spawnTime) {
+            return child.pid
+          }
+        } catch {
+          // File doesn't exist yet — keep polling
+        }
+        await new Promise(resolve => setTimeout(resolve, SPAWN_VERIFY_POLL_MS))
+      }
+
+      // Timeout — daemon may have started but didn't write heartbeat in time
+      // Still return PID so caller can track it, but log warning
+      console.error(`[daemon-launcher] Warning: daemon PID ${child.pid} spawned but heartbeat not verified within ${SPAWN_VERIFY_TIMEOUT_MS}ms`)
       return child.pid
     },
     (cause) => daemonSpawnError(String(cause))

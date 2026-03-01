@@ -9,7 +9,7 @@ import * as E from 'fp-ts/Either'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import { type HookError, hookError } from '../types/errors'
-import { isDaemonAlive } from './daemon-launcher'
+import { isDaemonAlive, startDaemon } from './daemon-launcher'
 
 // ============================================================================
 // Types
@@ -144,3 +144,67 @@ export const checkDaemonHealth = (
     },
     (error: unknown) => hookError(`Daemon health check failed: ${String(error)}`)
   )
+
+// ============================================================================
+// State helpers
+// ============================================================================
+
+/**
+ * Update daemon_pid in state.json after a restart.
+ */
+export const updateDaemonPidInState = async (configDir: string, pid: number): Promise<void> => {
+  const statePath = path.join(configDir, 'state.json')
+  try {
+    const content = await fs.readFile(statePath, 'utf-8')
+    const state = JSON.parse(content) as Record<string, unknown>
+    state['daemon_pid'] = pid
+    state['daemon_heartbeat'] = Date.now() / 1000
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf-8')
+  } catch (error) {
+    console.error(`[daemon-health] Failed to update daemon PID in state: ${String(error)}`)
+  }
+}
+
+// ============================================================================
+// Ensure daemon alive (check + restart if needed)
+// ============================================================================
+
+/**
+ * Check daemon health and restart if dead or stale.
+ * Returns true if daemon is healthy (or was successfully restarted), false if unrecoverable.
+ *
+ * @param configDir - Path to config directory containing state.json, bridge.js, daemon.log
+ * @returns Promise<boolean> - true if daemon is alive, false if restart failed
+ */
+export const ensureDaemonAlive = async (configDir: string): Promise<boolean> => {
+  const healthResult = await checkDaemonHealth(configDir)()
+
+  if (E.isLeft(healthResult)) {
+    console.error(`[daemon-health] Health check failed: ${healthResult.left.message}`)
+    return false
+  }
+
+  const health = healthResult.right
+
+  if (health._tag === 'DaemonHealthy') {
+    return true
+  }
+
+  console.error(`[daemon-health] Daemon ${health._tag}: ${health._tag === 'DaemonDead' ? health.reason : `stale for ${health.staleForMs}ms`}`)
+
+  // Attempt restart
+  const bridgePath = path.join(configDir, 'bridge.js')
+  const logPath = path.join(configDir, 'daemon.log')
+
+  const spawnResult = await startDaemon(bridgePath, configDir, logPath)()
+
+  if (E.isLeft(spawnResult)) {
+    console.error(`[daemon-health] Failed to restart daemon: ${spawnResult.left.message}`)
+    return false
+  }
+
+  const newPid = spawnResult.right
+  console.error(`[daemon-health] Daemon restarted with PID ${newPid}`)
+  await updateDaemonPidInState(configDir, newPid)
+  return true
+}

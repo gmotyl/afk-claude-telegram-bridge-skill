@@ -14,6 +14,8 @@ import { handleStopRequest, type StopDecision, HEALTH_CHECK_INTERVAL_MS, MAX_REC
 // Mock daemon-health and daemon-launcher for recovery tests
 jest.mock('../../services/daemon-health', () => ({
   checkDaemonHealth: jest.fn(),
+  ensureDaemonAlive: jest.fn().mockResolvedValue(true),
+  updateDaemonPidInState: jest.fn().mockResolvedValue(undefined),
 }))
 
 jest.mock('../../services/daemon-launcher', () => ({
@@ -191,13 +193,28 @@ describe('Stop Hook Handler', () => {
       expect(firstEvent.sessionId).toBe(sessionId)
     })
 
-    it('returns Left error when session IPC directory does not exist', async () => {
-      const result = await handleStopRequest(ipcBaseDir, 'nonexistent-session', slotNum, 'done')()
+    it('creates IPC directory if it does not exist and writes stop event', async () => {
+      const nonexistentSession = 'nonexistent-session'
+      const nonexistentDir = path.join(ipcBaseDir, nonexistentSession)
 
-      expect(E.isLeft(result)).toBe(true)
-      if (E.isLeft(result)) {
-        expect(result.left._tag).toBe('HookError')
+      // Write a kill file after a short delay so the polling loop exits
+      const killPromise = (async () => {
+        await new Promise(resolve => setTimeout(resolve, 200))
+        // The mkdir in handleStopRequest will have created the dir by now
+        await fs.writeFile(path.join(nonexistentDir, 'kill'), '', 'utf-8')
+      })()
+
+      const result = await handleStopRequest(ipcBaseDir, nonexistentSession, slotNum, 'done')()
+      await killPromise
+
+      expect(E.isRight(result)).toBe(true)
+      if (E.isRight(result)) {
+        expect(result.right.decision).toBeNull()
       }
+
+      // Verify the directory was created
+      const dirExists = await fs.access(nonexistentDir).then(() => true).catch(() => false)
+      expect(dirExists).toBe(true)
     })
   })
 

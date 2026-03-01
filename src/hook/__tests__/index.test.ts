@@ -7,6 +7,13 @@ import * as E from 'fp-ts/Either'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
+
+// Mock ensureDaemonAlive to avoid real daemon health checks in hook tests
+jest.mock('../../services/daemon-health', () => ({
+  ...jest.requireActual('../../services/daemon-health'),
+  ensureDaemonAlive: jest.fn().mockResolvedValue(true),
+}))
+
 import { runHook } from '../index'
 
 /** Helper: create a test environment with config, state, and per-session IPC dir */

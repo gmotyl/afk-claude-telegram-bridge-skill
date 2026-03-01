@@ -1022,6 +1022,10 @@ export const startDaemon = (configPath: string): TE.TaskEither<DaemonError, Stop
         trustedSessions: new Set()
       }
 
+      // Write initial heartbeat immediately so hooks can verify startup
+      const heartbeatPath = path.join(configDir, 'daemon.heartbeat')
+      await fs.writeFile(heartbeatPath, String(Date.now()), 'utf-8')
+
       // Main loop — sequential async iterations (no overlapping)
       let iterating = false
       const loopInterval = setInterval(async () => {
