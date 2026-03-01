@@ -28,7 +28,7 @@ fi
 
 # --- Detect update vs fresh install ---
 UPDATING=false
-if [ -f "$INSTALL_DIR/hook.js" ] || [ -f "$INSTALL_DIR/hook.py" ]; then
+if [ -f "$INSTALL_DIR/hook.js" ]; then
   UPDATING=true
 fi
 
@@ -71,12 +71,14 @@ mkdir -p "$COMMANDS_DIR"
 if [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/skills" ]; then
   [ -f "$SCRIPT_DIR/skills/afk/SKILL.md" ] && cp "$SCRIPT_DIR/skills/afk/SKILL.md" "$COMMANDS_DIR/afk.md"
   [ -f "$SCRIPT_DIR/skills/back/SKILL.md" ] && cp "$SCRIPT_DIR/skills/back/SKILL.md" "$COMMANDS_DIR/back.md"
+  [ -f "$SCRIPT_DIR/skills/afk-reset/SKILL.md" ] && cp "$SCRIPT_DIR/skills/afk-reset/SKILL.md" "$COMMANDS_DIR/afk-reset.md"
 else
   curl -fsSL "$REPO_BASE/skills/afk/SKILL.md" -o "$COMMANDS_DIR/afk.md" 2>/dev/null || true
   curl -fsSL "$REPO_BASE/skills/back/SKILL.md" -o "$COMMANDS_DIR/back.md" 2>/dev/null || true
+  curl -fsSL "$REPO_BASE/skills/afk-reset/SKILL.md" -o "$COMMANDS_DIR/afk-reset.md" 2>/dev/null || true
 fi
 
-echo "Commands installed: /afk, /back"
+echo "Commands installed: /afk, /back, /afk-reset"
 
 # --- Initialize state.json if missing ---
 if [ ! -f "$INSTALL_DIR/state.json" ]; then
@@ -88,59 +90,41 @@ fi
 echo ""
 echo "Registering hooks in settings.json..."
 
-python3 -c "
-import json, os
+node -e "
+const fs = require('fs');
+const settingsPath = '$SETTINGS';
+const hookCmd = '$INSTALL_DIR/hook.sh';
 
-settings_path = '$SETTINGS'
-hook_cmd = '$INSTALL_DIR/hook.sh'
+const settings = fs.existsSync(settingsPath)
+  ? JSON.parse(fs.readFileSync(settingsPath, 'utf8'))
+  : {};
 
-# Load existing settings
-if os.path.exists(settings_path):
-    with open(settings_path) as f:
-        settings = json.load(f)
-else:
-    settings = {}
+const hooks = settings.hooks || {};
 
-hooks = settings.setdefault('hooks', {})
+const hookConfigs = {
+  Stop: { timeout: 660 },
+  Notification: { timeout: 10 },
+  PreToolUse: { timeout: 360 },
+};
 
-# Hook configurations per event
-hook_configs = {
-    'Stop': {'timeout': 660},
-    'Notification': {'timeout': 10},
-    'PreToolUse': {'timeout': 360},
+for (const [event, cfg] of Object.entries(hookConfigs)) {
+  let eventHooks = hooks[event] || [];
+
+  // Remove any existing telegram-bridge entries
+  eventHooks = eventHooks.filter(h =>
+    !(h.hooks || []).some(hk => (hk.command || '').includes('telegram-bridge'))
+  );
+
+  eventHooks.push({
+    matcher: '',
+    hooks: [{ type: 'command', command: hookCmd, timeout: cfg.timeout }],
+  });
+  hooks[event] = eventHooks;
 }
 
-for event, cfg in hook_configs.items():
-    event_hooks = hooks.get(event, [])
-
-    # Remove any existing telegram-bridge entries (both Python and TS)
-    event_hooks = [
-        h for h in event_hooks
-        if not any(
-            'telegram-bridge' in hk.get('command', '')
-            for hk in h.get('hooks', [])
-        )
-    ]
-
-    # Add telegram-bridge hook
-    entry = {
-        'matcher': '',
-        'hooks': [{
-            'type': 'command',
-            'command': hook_cmd,
-            'timeout': cfg['timeout'],
-        }]
-    }
-    event_hooks.append(entry)
-    hooks[event] = event_hooks
-
-settings['hooks'] = hooks
-
-with open(settings_path, 'w') as f:
-    json.dump(settings, f, indent=2)
-    f.write('\n')
-
-print('Hooks registered for: ' + ', '.join(hook_configs.keys()))
+settings.hooks = hooks;
+fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+console.log('Hooks registered for: ' + Object.keys(hookConfigs).join(', '));
 "
 
 # --- Config setup ---
@@ -149,12 +133,17 @@ CONFIG_FILE="$INSTALL_DIR/config.json"
 if [ -f "$CONFIG_FILE" ]; then
   echo ""
   echo "Existing bot configuration found."
-  read -p "Re-run Telegram bot setup? [y/N]: " RERUN
-  if [ "${RERUN,,}" != "y" ]; then
-    # Skip setup, jump to done
-    SKIP_SETUP=true
+  if [ -t 0 ]; then
+    read -p "Re-run Telegram bot setup? [y/N]: " RERUN
+    RERUN_LOWER=$(echo "$RERUN" | tr '[:upper:]' '[:lower:]')
+    if [ "$RERUN_LOWER" != "y" ]; then
+      SKIP_SETUP=true
+    else
+      SKIP_SETUP=false
+    fi
   else
-    SKIP_SETUP=false
+    # Non-interactive mode (e.g. npm run deploy) — skip setup
+    SKIP_SETUP=true
   fi
 else
   SKIP_SETUP=false
@@ -195,20 +184,16 @@ if [ "${SKIP_SETUP:-false}" = false ]; then
     exit 1
   fi
 
-  CHATS=$(echo "$RESPONSE" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-chats = {}
-for result in data.get('result', []):
-    chat = result.get('message', {}).get('chat', {})
-    chat_id = chat.get('id')
-    chat_type = chat.get('type')
-    title = chat.get('title', 'Private Chat')
-    if chat_id:
-        chats[chat_id] = {'type': chat_type, 'title': title}
-
-for cid, info in sorted(chats.items()):
-    print(f\"{cid}|{info['type']}|{info['title']}\")
+  CHATS=$(echo "$RESPONSE" | node -e "
+const data = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
+const chats = {};
+for (const result of data.result || []) {
+  const chat = (result.message || {}).chat || {};
+  if (chat.id) chats[chat.id] = { type: chat.type, title: chat.title || 'Private Chat' };
+}
+Object.keys(chats).sort((a, b) => Number(a) - Number(b)).forEach(cid => {
+  console.log(cid + '|' + chats[cid].type + '|' + chats[cid].title);
+});
 " 2>/dev/null)
 
   if [ -z "$CHATS" ]; then
@@ -281,6 +266,7 @@ echo "  $INSTALL_DIR/hook.sh"
 echo "  $INSTALL_DIR/config.json"
 echo "  $COMMANDS_DIR/afk.md"
 echo "  $COMMANDS_DIR/back.md"
+echo "  $COMMANDS_DIR/afk-reset.md"
 echo ""
 echo "Hooks registered in:"
 echo "  $SETTINGS"
@@ -291,4 +277,5 @@ echo "Usage (after restart):"
 echo "  /afk              Activate AFK mode"
 echo "  /afk my-project   Activate with custom topic name"
 echo "  /back             Deactivate AFK mode"
+echo "  /afk-reset        Nuclear reset (kill daemons, clear state)"
 echo ""
