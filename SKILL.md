@@ -22,29 +22,37 @@ Installs a complete Telegram ↔ Claude Code bridge that allows you to:
 2. **Continue tasks** by sending new instructions when Claude finishes
 3. **Auto-approve** read-only tools (Read, Glob, Grep, WebSearch, WebFetch)
 4. **Multi-session support** — up to 4 concurrent sessions (S1-S4)
-5. **Zero dependencies** — Python stdlib only
+5. **Minimal dependencies** — Node.js with fp-ts only
 
 ## Installation
 
-Run the installer — it copies files, registers hooks, installs `/afk` and `/back` commands, and walks you through Telegram bot setup:
+Install via curl (recommended):
 
 ```bash
-bash ~/.claude/skills/afk-claude-telegram-bridge/install.sh
+curl -fsSL https://raw.githubusercontent.com/gmotyl/afk-claude-telegram-bridge/main/install.sh | bash
 ```
 
-The installer handles everything:
-- Copies hook.py, hook.sh, bridge.py to `~/.claude/hooks/telegram-bridge/`
-- Installs `/afk` and `/back` commands to `~/.claude/commands/`
-- Registers Stop, Notification, and PermissionRequest hooks in `~/.claude/settings.json`
+Or from a local clone:
+
+```bash
+git clone https://github.com/gmotyl/afk-claude-telegram-bridge.git
+cd afk-claude-telegram-bridge
+npm install && npm run deploy
+```
+
+The installer downloads pre-built binaries from GitHub and handles everything:
+- Copies hook.js, bridge.js, cli.js, hook.sh to `~/.claude/hooks/telegram-bridge/`
+- Installs `/afk`, `/back`, and `/afk-reset` commands to `~/.claude/commands/`
+- Registers Stop, Notification, and PreToolUse hooks in `~/.claude/settings.json`
 - Prompts for your bot token and auto-detects your Telegram group
 
-**Restart Claude Code after installation** to load the new `/afk` and `/back` commands.
+**Restart Claude Code after installation** to load the new commands.
 
 ### Prerequisites
 
 Before running the installer, create a Telegram bot:
 
-1. Open Telegram → search **@BotFather** → send `/newbot`
+1. Open Telegram -> search **@BotFather** -> send `/newbot`
 2. Name it "Claude Bridge" (or your preferred name)
 3. Copy the bot token
 4. Create a **Telegram Group** with **Topics enabled**
@@ -100,10 +108,10 @@ S2: push to remote
 After installation:
 ```
 ~/.claude/hooks/telegram-bridge/
-  hook.sh        — Bash entry point
-  hook.py        — Hook logic
-  bridge.py      — Telegram daemon
-  config.json    — Bot token, chat_id, settings
+  hook.sh        — Bash wrapper (Claude Code calls this)
+  hook.js        — Compiled hook entry point (Node.js)
+  bridge.js      — Compiled Telegram daemon (Node.js)
+  config.json    — Bot token, group ID, settings
   state.json     — Runtime state
   daemon.log     — Daemon log
   ipc/           — Per-session IPC
@@ -111,6 +119,7 @@ After installation:
 ~/.claude/commands/
   afk.md         — /afk command
   back.md        — /back command
+  afk-reset.md   — /afk-reset command
 ```
 
 ## Commands Reference
@@ -119,6 +128,7 @@ After installation:
 |---------|-------------|
 | `hook.sh --activate <session_id> [project]` | Activate AFK mode |
 | `hook.sh --deactivate <session_id>` | Deactivate AFK mode |
+| `hook.sh --reset` | Nuclear reset (kill daemons, clear state) |
 | `hook.sh --status` | Show active sessions |
 | `hook.sh --setup` | Configure bot token/chat_id |
 | `hook.sh --help` | Show help |
@@ -127,14 +137,18 @@ After installation:
 
 - **Daemon log**: `cat ~/.claude/hooks/telegram-bridge/daemon.log`
 - **Status**: `~/.claude/hooks/telegram-bridge/hook.sh --status`
-- **Manual start**: `python3 ~/.claude/hooks/telegram-bridge/bridge.py`
+- **Manual start**: `node ~/.claude/hooks/telegram-bridge/bridge.js`
 - **Kill daemon**: Check PID in `state.json`, then `kill <pid>`
 
 ## Dependencies
 
-- Python 3 (stdlib only — no pip packages needed)
+- Node.js 18+
 - bash
 - Telegram bot token
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Credits
 
