@@ -1,56 +1,30 @@
 import * as esbuild from 'esbuild'
 import * as fs from 'fs'
-import * as path from 'path'
 
-await Promise.all([
-  esbuild.build({
-    entryPoints: ['src/hook/index.ts'],
-    bundle: true,
-    minify: true,
-    platform: 'node',
-    target: 'node18',
-    outfile: 'dist/hook.js',
-    // Don't add banner since source file has shebang
-  }).then(() => {
-    // Add shebang if not already present
-    const hookPath = 'dist/hook.js'
-    let content = fs.readFileSync(hookPath, 'utf8')
-    if (!content.startsWith('#!/usr/bin/env node')) {
-      content = '#!/usr/bin/env node\n' + content
-      fs.writeFileSync(hookPath, content)
-    }
-  }),
-  esbuild.build({
-    entryPoints: ['src/bridge/daemon.ts'],
-    bundle: true,
-    minify: true,
-    platform: 'node',
-    target: 'node18',
-    outfile: 'dist/bridge.js',
-    // Don't add banner since source file has shebang
-  }).then(() => {
-    // Add shebang if not already present
-    const bridgePath = 'dist/bridge.js'
-    let content = fs.readFileSync(bridgePath, 'utf8')
-    if (!content.startsWith('#!/usr/bin/env node')) {
-      content = '#!/usr/bin/env node\n' + content
-      fs.writeFileSync(bridgePath, content)
-    }
-  }),
-  esbuild.build({
-    entryPoints: ['src/cli/index.ts'],
-    bundle: true,
-    minify: true,
-    platform: 'node',
-    target: 'node18',
-    outfile: 'dist/cli.js',
-  }).then(() => {
-    const cliPath = 'dist/cli.js'
-    let content = fs.readFileSync(cliPath, 'utf8')
-    if (!content.startsWith('#!/usr/bin/env node')) {
-      content = '#!/usr/bin/env node\n' + content
-      fs.writeFileSync(cliPath, content)
-    }
-  }),
-])
+const addShebang = (filePath) => {
+  let content = fs.readFileSync(filePath, 'utf8')
+  if (!content.startsWith('#!/usr/bin/env node')) {
+    content = '#!/usr/bin/env node\n' + content
+    fs.writeFileSync(filePath, content)
+  }
+}
+
+const bundles = [
+  { entryPoints: ['src/hook/index.ts'], outfile: 'dist/hook.js' },
+  { entryPoints: ['src/bridge/daemon.ts'], outfile: 'dist/bridge.js' },
+  { entryPoints: ['src/cli/index.ts'], outfile: 'dist/cli.js' },
+]
+
+await Promise.all(
+  bundles.map(({ entryPoints, outfile }) =>
+    esbuild.build({
+      entryPoints,
+      bundle: true,
+      minify: true,
+      platform: 'node',
+      target: 'node18',
+      outfile,
+    }).then(() => addShebang(outfile))
+  )
+)
 console.log('Build complete')
