@@ -19,16 +19,19 @@ const command = args[0]
 const run = async (): Promise<void> => {
   switch (command) {
     case 'activate': {
-      const sessionId = args[1]
-      const project = args[2]
-      const topicName = args[3] || project
+      const verbose = args.includes('--verbose')
+      const positionalArgs = args.slice(1).filter(a => !a.startsWith('--'))
+      const sessionId = positionalArgs[0]
+      const project = positionalArgs[1]
+      const topicName = positionalArgs[2] || project
 
       if (!sessionId || !project) {
-        console.error('Usage: cli.js activate <sessionId> <project> [topicName]')
+        console.error('Usage: cli.js activate <sessionId> <project> [topicName] [--verbose]')
         process.exit(1)
+        return
       }
 
-      const result = await activate(configDir, sessionId, project, topicName)()
+      const result = await activate(configDir, sessionId, project, topicName ?? project, verbose)()
 
       if (E.isLeft(result)) {
         console.error(`Activation failed: ${errorMessage(result.left)}`)
@@ -40,6 +43,7 @@ const run = async (): Promise<void> => {
       console.log(`  Slot: ${r.slotNum}`)
       console.log(`  Session: ${r.sessionId}`)
       console.log(`  Topic: ${r.topicName}`)
+      if (verbose) console.log(`  Verbose: enabled`)
       if (r.threadId) console.log(`  Thread: ${r.threadId} (reattached)`)
       console.log(`  Daemon PID: ${r.daemonPid}`)
       break

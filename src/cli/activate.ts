@@ -30,7 +30,8 @@ export const activate = (
   configDir: string,
   sessionId: string,
   project: string,
-  topicName: string
+  topicName: string,
+  verbose: boolean = false
 ): TE.TaskEither<BridgeError, ActivateResult> => {
   const configPath = path.join(configDir, 'config.json')
   const statePath = path.join(configDir, 'state.json')
@@ -81,6 +82,7 @@ export const activate = (
         projectName: project,
         topicName,
         ...(reattachThreadId !== undefined ? { threadId: reattachThreadId } : {}),
+        ...(verbose ? { verbose: true } : {}),
         activatedAt: new Date(),
         lastHeartbeat: new Date(),
       }

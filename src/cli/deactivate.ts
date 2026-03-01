@@ -13,9 +13,9 @@ import { loadConfig } from '../core/config'
 import { loadState, saveState } from '../services/state-persistence'
 import { withStateLock } from '../services/file-lock'
 import { findSlotBySessionId, removeSlot } from '../core/state'
-import { writeEvent, removeIpcDir } from '../services/ipc'
-import { sessionEnd } from '../types/events'
+import { removeIpcDir } from '../services/ipc'
 import { stopDaemon, isDaemonAlive } from '../services/daemon-launcher'
+import { sendMessageToTopic, deleteForumTopic } from '../services/telegram'
 
 export const deactivate = (
   configDir: string,
@@ -57,10 +57,14 @@ export const deactivate = (
         slotSessionId = firstActive[1]!.sessionId
       }
 
-      // 3. Write SessionEnd event
-      const ipcDir = path.join(config.ipcBaseDir, slotSessionId)
-      const eventsFile = path.join(ipcDir, `event-S${slotNum}.jsonl`)
-      await writeEvent(eventsFile, sessionEnd(slotNum))()
+      // 3. Send Telegram deactivation message and delete topic
+      const slot = state.slots[slotNum]
+      if (slot?.threadId) {
+        const token = config.telegramBotToken
+        const chatId = String(config.telegramGroupId)
+        await sendMessageToTopic(token, chatId, `🔴 S${slotNum} deactivated — ${slot.projectName}`, slot.threadId)()
+        await deleteForumTopic(token, chatId, slot.threadId)()
+      }
 
       // 4. Remove slot from state
       state = removeSlot(state, slotNum)
@@ -71,7 +75,7 @@ export const deactivate = (
         throw new Error(`Failed to save state: ${saveResult.left.message}`)
       }
 
-      // 6. Clean IPC dir
+      // 6. Clean IPC dir (safe now since we handled Telegram directly)
       await removeIpcDir(config.ipcBaseDir, slotSessionId)()
 
       // 7. Stop daemon if no slots remain
