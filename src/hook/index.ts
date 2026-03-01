@@ -28,6 +28,7 @@ import { loadConfig } from '../core/config'
 import { Config } from '../types/config'
 import { loadState } from '../services/state-persistence'
 import { findBoundSession, findUnboundSession, bindSession } from '../services/session-binding'
+import { ensureDaemonAlive } from '../services/daemon-health'
 import { type HookError, hookError } from '../types/errors'
 
 // ============================================================================
@@ -182,7 +183,25 @@ export const runHook = (
         return 0
       }
 
-      // Step 6: Dispatch based on hook type
+      // Step 6: Ensure daemon is alive before dispatching
+      const daemonAlive = await ensureDaemonAlive(configDir)
+      if (!daemonAlive) {
+        console.error('[hook] Daemon not alive and restart failed — falling back')
+        if (hookArgs.type === 'permission_request') {
+          // Auto-approve: safer than 350s hang on dead daemon
+          process.stdout.write(JSON.stringify({
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              permissionDecision: 'allow',
+            }
+          }))
+          return 0
+        }
+        // Stop/notification: let Claude stop normally
+        return 0
+      }
+
+      // Step 7: Dispatch based on hook type
       switch (hookArgs.type) {
         case 'permission_request':
           return await handlePermissionRequest(hookArgs, config.ipcBaseDir, resolved, timeoutMs)
