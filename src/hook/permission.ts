@@ -33,7 +33,7 @@ export interface PermissionResponse {
 // Constants
 // ============================================================================
 
-const DEFAULT_TIMEOUT_MS = 30000
+const DEFAULT_TIMEOUT_MS = 350000
 const POLLING_INTERVAL_MS = 100
 
 // ============================================================================
@@ -43,50 +43,36 @@ const POLLING_INTERVAL_MS = 100
 /**
  * Request permission from daemon to execute a tool command.
  *
- * Process:
- * 1. Generate unique request ID
- * 2. Write permission request event to IPC queue
- * 3. Poll for response file from daemon
- * 4. Parse and validate response
- * 5. Clean up response file
- * 6. Return approval status
- *
- * @param ipcDir - Path to IPC directory where events.jsonl is written
+ * @param ipcBaseDir - Base IPC directory (e.g. ~/.claude/hooks/telegram-bridge/ipc/)
+ * @param sessionId - Resolved AFK session UUID (IPC directory name)
+ * @param slotNum - Resolved slot number
  * @param hookArgs - Hook arguments containing tool and command
  * @param timeoutMs - Maximum milliseconds to wait for response (default: 30000)
  * @returns TaskEither<HookError, PermissionResponse>
- *
- * @example
- * const result = await requestPermission('/tmp/ipc', {
- *   type: 'permission_request',
- *   tool: 'Bash',
- *   command: 'npm install'
- * }, 10000)()
- *
- * if (E.isRight(result)) {
- *   if (result.right.approved) {
- *     // Execute command
- *   }
- * }
  */
 export const requestPermission = (
-  ipcDir: string,
+  ipcBaseDir: string,
+  sessionId: string,
+  slotNum: number,
   hookArgs: HookArgs,
   timeoutMs: number = DEFAULT_TIMEOUT_MS
 ): TE.TaskEither<HookError, PermissionResponse> =>
   TE.tryCatch(
     async () => {
       // Validate hook args
-      if (hookArgs.type !== 'permission_request' || !hookArgs.tool || !hookArgs.command) {
+      if (hookArgs.type !== 'permission_request' || !hookArgs.tool) {
         throw hookError('Invalid hook arguments for permission request')
       }
 
       // Generate unique request ID
       const requestId = randomUUID()
 
-      // Write permission request event to IPC queue
-      const eventsFile = path.join(ipcDir, 'events.jsonl')
-      const event = permissionRequest(requestId, hookArgs.tool, hookArgs.command)
+      // Resolve per-session IPC directory
+      const sessionIpcDir = path.join(ipcBaseDir, sessionId)
+      const eventsFile = path.join(sessionIpcDir, 'events.jsonl')
+
+      const commandDisplay = hookArgs.command || hookArgs.tool
+      const event = permissionRequest(requestId, hookArgs.tool, commandDisplay, slotNum)
 
       const writeResult = await writeEvent(eventsFile, event)()
       if (!('right' in writeResult)) {
@@ -94,10 +80,10 @@ export const requestPermission = (
       }
 
       // Poll for response file
-      const response = await pollForResponse(ipcDir, requestId, timeoutMs)
+      const response = await pollForResponse(sessionIpcDir, requestId, timeoutMs)
 
       // Clean up response file
-      const responseFile = path.join(ipcDir, `response-${requestId}.json`)
+      const responseFile = path.join(sessionIpcDir, `response-${requestId}.json`)
       await fs
         .unlink(responseFile)
         .catch(() => {
@@ -123,13 +109,6 @@ export const requestPermission = (
 
 /**
  * Poll for response file until timeout.
- * Checks if response file exists, reads and parses it.
- *
- * @param ipcDir - Path to IPC directory
- * @param requestId - Request ID to match response file
- * @param timeoutMs - Maximum time to wait in milliseconds
- * @returns Promise<PermissionResponse>
- * @throws HookError if timeout or parsing fails
  */
 const pollForResponse = async (
   ipcDir: string,

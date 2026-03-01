@@ -12,15 +12,15 @@ import { requestPermission, type PermissionResponse } from '../permission'
 import { type HookArgs } from '../args'
 
 // Helper to get request ID from events file
-const getLastRequestId = async (ipcDir: string): Promise<string | null> => {
+const getLastRequestId = async (sessionDir: string): Promise<string | null> => {
   try {
-    const files = await fs.readdir(ipcDir)
+    const files = await fs.readdir(sessionDir)
     const eventFiles = files.filter(f => f.startsWith('events'))
     if (eventFiles.length === 0) return null
 
     const firstFile = eventFiles[0]
     if (!firstFile) return null
-    const eventFile = path.join(ipcDir, firstFile)
+    const eventFile = path.join(sessionDir, firstFile)
     const content = await fs.readFile(eventFile, 'utf-8')
     const lines = content.split('\n').filter(l => l.trim())
     if (lines.length === 0) return null
@@ -35,15 +35,20 @@ const getLastRequestId = async (ipcDir: string): Promise<string | null> => {
 }
 
 describe('Permission Request Handler', () => {
-  let tempDir: string
+  let ipcBaseDir: string
+  let sessionDir: string
+  const sessionId = 'test-session-uuid'
+  const slotNum = 1
 
   beforeEach(async () => {
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'hook-permission-test-'))
+    ipcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'hook-permission-test-'))
+    sessionDir = path.join(ipcBaseDir, sessionId)
+    await fs.mkdir(sessionDir, { recursive: true })
   })
 
   afterEach(async () => {
     try {
-      await fs.rm(tempDir, { recursive: true, force: true })
+      await fs.rm(ipcBaseDir, { recursive: true, force: true })
     } catch {
       // Ignore cleanup errors
     }
@@ -58,17 +63,16 @@ describe('Permission Request Handler', () => {
           command: 'npm install',
         }
 
-        // Simulate daemon response by writing response file after a short delay
         const responsePromise = (async () => {
           await new Promise(resolve => setTimeout(resolve, 50))
-          const requestId = await getLastRequestId(tempDir)
+          const requestId = await getLastRequestId(sessionDir)
           if (requestId) {
-            const responseFile = path.join(tempDir, `response-${requestId}.json`)
+            const responseFile = path.join(sessionDir, `response-${requestId}.json`)
             await fs.writeFile(responseFile, JSON.stringify({ approved: true }), 'utf-8')
           }
         })()
 
-        const result = await requestPermission(tempDir, hookArgs, 5000)()
+        const result = await requestPermission(ipcBaseDir, sessionId, slotNum, hookArgs, 5000)()
         await responsePromise
 
         expect(E.isRight(result)).toBe(true)
@@ -86,9 +90,9 @@ describe('Permission Request Handler', () => {
 
         const responsePromise = (async () => {
           await new Promise(resolve => setTimeout(resolve, 50))
-          const requestId = await getLastRequestId(tempDir)
+          const requestId = await getLastRequestId(sessionDir)
           if (requestId) {
-            const responseFile = path.join(tempDir, `response-${requestId}.json`)
+            const responseFile = path.join(sessionDir, `response-${requestId}.json`)
             await fs.writeFile(
               responseFile,
               JSON.stringify({ approved: true, reason: 'Safe script detected' }),
@@ -97,7 +101,7 @@ describe('Permission Request Handler', () => {
           }
         })()
 
-        const result = await requestPermission(tempDir, hookArgs, 5000)()
+        const result = await requestPermission(ipcBaseDir, sessionId, slotNum, hookArgs, 5000)()
         await responsePromise
 
         expect(E.isRight(result)).toBe(true)
@@ -119,9 +123,9 @@ describe('Permission Request Handler', () => {
 
         const responsePromise = (async () => {
           await new Promise(resolve => setTimeout(resolve, 50))
-          const requestId = await getLastRequestId(tempDir)
+          const requestId = await getLastRequestId(sessionDir)
           if (requestId) {
-            const responseFile = path.join(tempDir, `response-${requestId}.json`)
+            const responseFile = path.join(sessionDir, `response-${requestId}.json`)
             await fs.writeFile(
               responseFile,
               JSON.stringify({ approved: false, reason: 'Dangerous command' }),
@@ -130,7 +134,7 @@ describe('Permission Request Handler', () => {
           }
         })()
 
-        const result = await requestPermission(tempDir, hookArgs, 5000)()
+        const result = await requestPermission(ipcBaseDir, sessionId, slotNum, hookArgs, 5000)()
         await responsePromise
 
         expect(E.isRight(result)).toBe(true)
@@ -143,7 +147,7 @@ describe('Permission Request Handler', () => {
     })
 
     describe('IPC event writing', () => {
-      it('writes permission request to events.jsonl', async () => {
+      it('writes permission request to per-session events.jsonl', async () => {
         const hookArgs: HookArgs = {
           type: 'permission_request',
           tool: 'Bash',
@@ -152,17 +156,18 @@ describe('Permission Request Handler', () => {
 
         const responsePromise = (async () => {
           await new Promise(resolve => setTimeout(resolve, 50))
-          const requestId = await getLastRequestId(tempDir)
+          const requestId = await getLastRequestId(sessionDir)
           if (requestId) {
-            const responseFile = path.join(tempDir, `response-${requestId}.json`)
+            const responseFile = path.join(sessionDir, `response-${requestId}.json`)
             await fs.writeFile(responseFile, JSON.stringify({ approved: true }), 'utf-8')
           }
         })()
 
-        await requestPermission(tempDir, hookArgs, 5000)()
+        await requestPermission(ipcBaseDir, sessionId, slotNum, hookArgs, 5000)()
         await responsePromise
 
-        const eventsFile = path.join(tempDir, 'events.jsonl')
+        // Events written to per-session directory
+        const eventsFile = path.join(sessionDir, 'events.jsonl')
         const exists = await fs
           .access(eventsFile)
           .then(() => true)
@@ -181,6 +186,7 @@ describe('Permission Request Handler', () => {
           expect(event.tool).toBe('Bash')
           expect(event.command).toBe('npm install')
           expect(event.requestId).toBeDefined()
+          expect(event.slotNum).toBe(slotNum)
         }
       })
     })
@@ -193,8 +199,7 @@ describe('Permission Request Handler', () => {
           command: 'npm install',
         }
 
-        // Use very short timeout to force timeout
-        const result = await requestPermission(tempDir, hookArgs, 50)()
+        const result = await requestPermission(ipcBaseDir, sessionId, slotNum, hookArgs, 50)()
 
         expect(E.isLeft(result)).toBe(true)
         if (E.isLeft(result)) {
@@ -202,35 +207,17 @@ describe('Permission Request Handler', () => {
           expect((result.left as any).message).toContain('timeout')
         }
       })
-
-      it('uses default timeout of 30 seconds when not provided', async () => {
-        const hookArgs: HookArgs = {
-          type: 'permission_request',
-          tool: 'Bash',
-          command: 'npm install',
-        }
-
-        // With default 30 second timeout and no response, should eventually timeout
-        // But we can test it respects the default by checking it waits longer than explicit short timeout
-        // Instead, just verify function signature accepts undefined timeout
-        const result = await requestPermission(tempDir, hookArgs, 100)()
-        expect(E.isLeft(result)).toBe(true)
-        if (E.isLeft(result)) {
-          expect((result.left as any)._tag).toBe('HookError')
-        }
-      }, 10000)
     })
 
     describe('error handling', () => {
-      it('returns HookError when IPC directory does not exist', async () => {
+      it('returns HookError when session IPC directory does not exist', async () => {
         const hookArgs: HookArgs = {
           type: 'permission_request',
           tool: 'Bash',
           command: 'npm install',
         }
 
-        const nonexistentDir = path.join(tempDir, 'nonexistent')
-        const result = await requestPermission(nonexistentDir, hookArgs, 1000)()
+        const result = await requestPermission(ipcBaseDir, 'nonexistent-session', slotNum, hookArgs, 1000)()
 
         expect(E.isLeft(result)).toBe(true)
         if (E.isLeft(result)) {
@@ -247,14 +234,14 @@ describe('Permission Request Handler', () => {
 
         const responsePromise = (async () => {
           await new Promise(resolve => setTimeout(resolve, 50))
-          const requestId = await getLastRequestId(tempDir)
+          const requestId = await getLastRequestId(sessionDir)
           if (requestId) {
-            const responseFile = path.join(tempDir, `response-${requestId}.json`)
+            const responseFile = path.join(sessionDir, `response-${requestId}.json`)
             await fs.writeFile(responseFile, 'invalid json {', 'utf-8')
           }
         })()
 
-        const result = await requestPermission(tempDir, hookArgs, 5000)()
+        const result = await requestPermission(ipcBaseDir, sessionId, slotNum, hookArgs, 5000)()
         await responsePromise
 
         expect(E.isLeft(result)).toBe(true)
@@ -272,14 +259,14 @@ describe('Permission Request Handler', () => {
 
         const responsePromise = (async () => {
           await new Promise(resolve => setTimeout(resolve, 50))
-          const requestId = await getLastRequestId(tempDir)
+          const requestId = await getLastRequestId(sessionDir)
           if (requestId) {
-            const responseFile = path.join(tempDir, `response-${requestId}.json`)
+            const responseFile = path.join(sessionDir, `response-${requestId}.json`)
             await fs.writeFile(responseFile, JSON.stringify({ reason: 'No approved field' }), 'utf-8')
           }
         })()
 
-        const result = await requestPermission(tempDir, hookArgs, 5000)()
+        const result = await requestPermission(ipcBaseDir, sessionId, slotNum, hookArgs, 5000)()
         await responsePromise
 
         expect(E.isLeft(result)).toBe(true)
@@ -300,17 +287,16 @@ describe('Permission Request Handler', () => {
         let responseFile: string | null = null
         const responsePromise = (async () => {
           await new Promise(resolve => setTimeout(resolve, 50))
-          const requestId = await getLastRequestId(tempDir)
+          const requestId = await getLastRequestId(sessionDir)
           if (requestId) {
-            responseFile = path.join(tempDir, `response-${requestId}.json`)
+            responseFile = path.join(sessionDir, `response-${requestId}.json`)
             await fs.writeFile(responseFile, JSON.stringify({ approved: true }), 'utf-8')
           }
         })()
 
-        await requestPermission(tempDir, hookArgs, 5000)()
+        await requestPermission(ipcBaseDir, sessionId, slotNum, hookArgs, 5000)()
         await responsePromise
 
-        // After the function completes, response file should be deleted
         if (responseFile) {
           const exists = await fs
             .access(responseFile)

@@ -24,9 +24,13 @@ import { handleStopRequest } from '../hook/stop'
 
 describe('Active Listening E2E', () => {
   let tempDir: string
+  let sessionDir: string
+  const sessionId = 'test-session-uuid'
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'e2e-active-listening-'))
+    sessionDir = path.join(tempDir, sessionId)
+    await fs.mkdir(sessionDir, { recursive: true })
   })
 
   afterEach(async () => {
@@ -137,15 +141,15 @@ describe('Active Listening E2E', () => {
       const responsePromise = (async () => {
         await new Promise(resolve => setTimeout(resolve, 200))
 
-        // Read the events.jsonl to find the eventId
-        const eventsFile = path.join(tempDir, 'events.jsonl')
+        // Read the events.jsonl to find the eventId (in per-session dir)
+        const eventsFile = path.join(sessionDir, 'events.jsonl')
         try {
           const content = await fs.readFile(eventsFile, 'utf-8')
           const lines = content.split('\n').filter(l => l.trim())
           for (const line of lines) {
             const event = JSON.parse(line) as { _tag?: string; eventId?: string }
             if (event._tag === 'Stop' && event.eventId) {
-              const responseFile = path.join(tempDir, `response-${event.eventId}.json`)
+              const responseFile = path.join(sessionDir, `response-${event.eventId}.json`)
               await fs.writeFile(
                 responseFile,
                 JSON.stringify({ instruction: 'run npm test' }),
@@ -159,14 +163,14 @@ describe('Active Listening E2E', () => {
         }
       })()
 
-      // Run the hook stop handler
-      const result = await handleStopRequest(tempDir, 1, 'last message')()
+      // Run the hook stop handler (now takes ipcBaseDir, sessionId, slotNum, lastMessage)
+      const result = await handleStopRequest(tempDir, sessionId, 1, 'last message')()
       await responsePromise
 
       expect(E.isRight(result)).toBe(true)
       if (E.isRight(result)) {
         expect(result.right.decision).toBe('block')
-        expect(result.right.instruction).toBe('run npm test')
+        expect(result.right.reason).toBe('run npm test')
       }
     })
   })
