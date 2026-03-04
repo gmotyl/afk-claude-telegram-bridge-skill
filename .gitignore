@@ -11,6 +11,10 @@ coverage/
 
 # Runtime files (belong in ~/.claude/hooks/telegram-bridge/, not repo root)
 daemon.heartbeat
-state.json
+daemon.pid
 daemon.log
+state.json
+bridge.db
+bridge.db-wal
+bridge.db-shm
 .gitnexus

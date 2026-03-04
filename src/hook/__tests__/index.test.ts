@@ -1,6 +1,6 @@
 /**
  * @module hook/index.test
- * Tests for hook main entry point with session binding
+ * Tests for hook main entry point with session binding (SQLite-backed)
  */
 
 import * as E from 'fp-ts/Either'
@@ -15,8 +15,55 @@ jest.mock('../../services/daemon-health', () => ({
 }))
 
 import { runHook } from '../index'
+import { openDatabase, closeDatabase, getDatabase } from '../../services/db'
+import { insertSession, insertResponse, updateSessionBinding, findSessionByClaudeId } from '../../services/db-queries'
 
-/** Helper: create a test environment with config, state, and per-session IPC dir */
+// ============================================================================
+// SQLite daemon simulation helpers
+// ============================================================================
+
+/** Get the last unprocessed event's ID and payload from SQLite */
+const getLastUnprocessedEvent = (): { id: string; payload: Record<string, unknown> } | null => {
+  const dbResult = getDatabase()
+  if (E.isLeft(dbResult)) return null
+
+  const events = dbResult.right
+    .prepare('SELECT * FROM events WHERE processed = 0 ORDER BY created_at DESC LIMIT 1')
+    .all() as Array<{ id: string; payload: string }>
+
+  if (events.length === 0) return null
+  return {
+    id: events[0]!.id,
+    payload: JSON.parse(events[0]!.payload) as Record<string, unknown>,
+  }
+}
+
+/** Count events for a session in SQLite */
+const countEventsForSession = (sessionId: string): number => {
+  const dbResult = getDatabase()
+  if (E.isLeft(dbResult)) return -1
+
+  const result = dbResult.right
+    .prepare('SELECT COUNT(*) as cnt FROM events WHERE session_id = ?')
+    .get(sessionId) as { cnt: number }
+
+  return result.cnt
+}
+
+/** Simulate daemon: wait, find event, write response to SQLite */
+const simulateDaemonResponse = (delayMs: number, responsePayload: Record<string, unknown>) =>
+  (async () => {
+    await new Promise(resolve => setTimeout(resolve, delayMs))
+    const event = getLastUnprocessedEvent()
+    if (event) {
+      const dbResult = getDatabase()
+      if (E.isRight(dbResult)) {
+        insertResponse(dbResult.right, `resp-${event.id}`, event.id, JSON.stringify(responsePayload))
+      }
+    }
+  })()
+
+/** Helper: create a test environment with config and SQLite-backed session */
 const createTestEnv = async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'hook-index-test-'))
   const ipcDir = path.join(tempDir, 'ipc')
@@ -35,51 +82,35 @@ const createTestEnv = async () => {
   const configPath = path.join(tempDir, 'config.json')
   await fs.writeFile(configPath, JSON.stringify(config), 'utf-8')
 
-  // Create state.json with one active slot
-  const state = {
-    slots: {
-      1: {
-        sessionId,
-        projectName: 'test-project',
-        topicName: 'Test Project',
-        activatedAt: new Date().toISOString(),
-        lastHeartbeat: new Date().toISOString(),
-      }
-    },
-    pendingStops: {}
-  }
-  const statePath = path.join(tempDir, 'state.json')
-  await fs.writeFile(statePath, JSON.stringify(state), 'utf-8')
+  // Open SQLite database at the same path runHook will use
+  const dbPath = path.join(tempDir, 'bridge.db')
+  const dbResult = openDatabase(dbPath)
+  if (E.isLeft(dbResult)) throw new Error('Failed to open test database')
+  const db = dbResult.right
 
-  return { tempDir, ipcDir, sessionIpcDir, sessionId, configPath, statePath }
+  // Insert session into SQLite (replaces state.json)
+  const insertResult = insertSession(db, sessionId, 1, 'test-project', new Date().toISOString())
+  expect(E.isRight(insertResult)).toBe(true)
+
+  return { tempDir, ipcDir, sessionIpcDir, sessionId, configPath, dbPath }
 }
 
-/** Read the last event's requestId from per-event files in a session IPC directory */
-const getRequestIdFromEventFiles = async (dir: string): Promise<string | null> => {
-  try {
-    const files = await fs.readdir(dir)
-    const eventFiles = files.filter(f => f.startsWith('event-') && f.endsWith('.jsonl')).sort()
-    if (eventFiles.length === 0) return null
-    const lastFile = eventFiles[eventFiles.length - 1]!
-    const content = await fs.readFile(path.join(dir, lastFile), 'utf-8')
-    const lines = content.split('\n').filter(l => l.trim())
-    const lastLine = lines[lines.length - 1]
-    if (!lastLine) return null
-    const event = JSON.parse(lastLine) as { requestId?: string }
-    return event.requestId ?? null
-  } catch {
-    return null
+/** Helper: clear all sessions from SQLite (for "no active session" tests) */
+const clearSessions = () => {
+  const dbResult = getDatabase()
+  if (E.isRight(dbResult)) {
+    dbResult.right.prepare('DELETE FROM sessions').run()
   }
 }
 
-/** Check if any per-event files exist in a directory */
-const hasEventFiles = async (dir: string): Promise<boolean> => {
-  try {
-    const files = await fs.readdir(dir)
-    return files.some(f => f.startsWith('event-') && f.endsWith('.jsonl'))
-  } catch {
-    return false
-  }
+/** Helper: check claude_session_id binding in SQLite */
+const getClaudeSessionBinding = (claudeSessionId: string): string | null => {
+  const dbResult = getDatabase()
+  if (E.isLeft(dbResult)) return null
+
+  const result = findSessionByClaudeId(dbResult.right, claudeSessionId)
+  if (E.isLeft(result) || !result.right) return null
+  return result.right.id
 }
 
 describe('Hook Main Entry Point', () => {
@@ -99,6 +130,7 @@ describe('Hook Main Entry Point', () => {
   })
 
   afterEach(async () => {
+    closeDatabase()
     try {
       await fs.rm(tempDir, { recursive: true, force: true })
     } catch {
@@ -109,7 +141,6 @@ describe('Hook Main Entry Point', () => {
   describe('runHook', () => {
     describe('permission_request hook', () => {
       it('processes permission_request and returns 0 when approved (decision via JSON stdout)', async () => {
-        // Use HookArgs with sessionId so binding resolves correctly
         const hookArgs = {
           type: 'permission_request' as const,
           tool: 'Bash',
@@ -117,18 +148,8 @@ describe('Hook Main Entry Point', () => {
           sessionId: 'claude-sess-A',
         }
 
-        // Simulate daemon response (write to per-session IPC dir)
-        const responsePromise = (async () => {
-          await new Promise(resolve => setTimeout(resolve, 100))
-
-          try {
-            const requestId = await getRequestIdFromEventFiles(sessionIpcDir)
-            if (requestId) {
-                const responseFile = path.join(sessionIpcDir, `response-${requestId}.json`)
-                await fs.writeFile(responseFile, JSON.stringify({ approved: true }), 'utf-8')
-            }
-          } catch { /* ignore */ }
-        })()
+        // Simulate daemon response via SQLite
+        const responsePromise = simulateDaemonResponse(100, { approved: true })
 
         const result = await runHook(configPath, hookArgs)()
         await responsePromise
@@ -148,17 +169,7 @@ describe('Hook Main Entry Point', () => {
           sessionId: 'claude-sess-A',
         }
 
-        const responsePromise = (async () => {
-          await new Promise(resolve => setTimeout(resolve, 100))
-
-          try {
-            const requestId = await getRequestIdFromEventFiles(sessionIpcDir)
-            if (requestId) {
-                const responseFile = path.join(sessionIpcDir, `response-${requestId}.json`)
-                await fs.writeFile(responseFile, JSON.stringify({ approved: false, reason: 'Dangerous' }), 'utf-8')
-            }
-          } catch { /* ignore */ }
-        })()
+        const responsePromise = simulateDaemonResponse(100, { approved: false, reason: 'Dangerous' })
 
         const result = await runHook(configPath, hookArgs)()
         await responsePromise
@@ -206,32 +217,14 @@ describe('Hook Main Entry Point', () => {
         }
       })
 
-      it('processes stop hook and returns 0 when response file appears', async () => {
+      it('processes stop hook and returns 0 when response appears in SQLite', async () => {
         const hookArgs = {
           type: 'stop' as const,
           sessionId: 'claude-sess-A',
           lastMessage: 'Task done',
         }
 
-        const responsePromise = (async () => {
-          await new Promise(resolve => setTimeout(resolve, 100))
-
-          try {
-            const files = await fs.readdir(sessionIpcDir)
-            const eventFiles = files.filter(f => f.startsWith('event-') && f.endsWith('.jsonl')).sort()
-            for (const file of eventFiles) {
-              const content = await fs.readFile(path.join(sessionIpcDir, file), 'utf-8')
-              const lines = content.split('\n').filter(l => l.trim())
-              for (const line of lines) {
-                const event = JSON.parse(line) as { eventId?: string; _tag?: string }
-                if (event._tag === 'Stop' && event.eventId) {
-                  const responseFile = path.join(sessionIpcDir, `response-${event.eventId}.json`)
-                  await fs.writeFile(responseFile, JSON.stringify({ instruction: 'test' }), 'utf-8')
-                }
-              }
-            }
-          } catch { /* ignore */ }
-        })()
+        const responsePromise = simulateDaemonResponse(100, { instruction: 'test' })
 
         const result = await runHook(configPath, hookArgs)()
         await responsePromise
@@ -261,9 +254,8 @@ describe('Hook Main Entry Point', () => {
 
     describe('no active AFK session', () => {
       it('auto-approves permission_request when no active slots (outputs allow JSON)', async () => {
-        // Overwrite state with empty slots
-        const statePath = path.join(tempDir, 'state.json')
-        await fs.writeFile(statePath, JSON.stringify({ slots: {}, pendingStops: {} }), 'utf-8')
+        // Clear all sessions from SQLite (no active slots)
+        clearSessions()
 
         const hookArgs = {
           type: 'permission_request' as const,
@@ -281,8 +273,8 @@ describe('Hook Main Entry Point', () => {
       })
 
       it('passes stop when no active slots (no JSON output)', async () => {
-        const statePath = path.join(tempDir, 'state.json')
-        await fs.writeFile(statePath, JSON.stringify({ slots: {}, pendingStops: {} }), 'utf-8')
+        // Clear all sessions from SQLite
+        clearSessions()
 
         const hookArgs = {
           type: 'stop' as const,
@@ -300,7 +292,7 @@ describe('Hook Main Entry Point', () => {
     })
 
     describe('session binding', () => {
-      it('creates bound_session file on first hook call', async () => {
+      it('binds claude_session_id in SQLite on first hook call', async () => {
         const hookArgs = {
           type: 'notification' as const,
           message: 'test',
@@ -309,16 +301,18 @@ describe('Hook Main Entry Point', () => {
 
         await runHook(configPath, hookArgs)()
 
-        // Check that bound_session file was created
-        const boundFile = path.join(sessionIpcDir, 'bound_session')
-        const content = await fs.readFile(boundFile, 'utf-8')
-        expect(content).toBe('claude-sess-X')
+        // Check that claude_session_id was set in SQLite
+        const boundSessionId = getClaudeSessionBinding('claude-sess-X')
+        expect(boundSessionId).toBe(sessionId)
       })
 
       it('reuses existing binding on subsequent calls', async () => {
-        // Pre-create binding
-        const boundFile = path.join(sessionIpcDir, 'bound_session')
-        await fs.writeFile(boundFile, 'claude-sess-Y', 'utf-8')
+        // Pre-create binding in SQLite
+        const dbResult = getDatabase()
+        expect(E.isRight(dbResult)).toBe(true)
+        if (E.isRight(dbResult)) {
+          updateSessionBinding(dbResult.right, sessionId, 'claude-sess-Y')
+        }
 
         // Kill file in session dir for quick stop exit
         await fs.writeFile(path.join(sessionIpcDir, 'kill'), '', 'utf-8')
@@ -337,37 +331,21 @@ describe('Hook Main Entry Point', () => {
         }
 
         // Verify binding wasn't changed
-        const content = await fs.readFile(boundFile, 'utf-8')
-        expect(content).toBe('claude-sess-Y')
+        const boundSessionId = getClaudeSessionBinding('claude-sess-Y')
+        expect(boundSessionId).toBe(sessionId)
       })
 
-      it('isolates two sessions to different IPC directories', async () => {
+      it('isolates two sessions to different SQLite session rows', async () => {
         const sessionIdB = 'test-session-uuid-B'
         const sessionIpcDirB = path.join(ipcDir, sessionIdB)
         await fs.mkdir(sessionIpcDirB, { recursive: true })
 
-        // Add second slot to state
-        const statePath = path.join(tempDir, 'state.json')
-        const state = {
-          slots: {
-            1: {
-              sessionId,
-              projectName: 'project-A',
-              topicName: 'Project A',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            },
-            2: {
-              sessionId: sessionIdB,
-              projectName: 'project-B',
-              topicName: 'Project B',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            }
-          },
-          pendingStops: {}
+        // Add second session to SQLite
+        const dbResult = getDatabase()
+        expect(E.isRight(dbResult)).toBe(true)
+        if (E.isRight(dbResult)) {
+          insertSession(dbResult.right, sessionIdB, 2, 'project-B', new Date().toISOString())
         }
-        await fs.writeFile(statePath, JSON.stringify(state), 'utf-8')
 
         // Session A binds first
         const hookArgsA = {
@@ -385,42 +363,23 @@ describe('Hook Main Entry Point', () => {
         }
         await runHook(configPath, hookArgsB)()
 
-        // Verify: A bound to first slot's IPC dir, B to second
-        const boundA = await fs.readFile(path.join(sessionIpcDir, 'bound_session'), 'utf-8')
-        const boundB = await fs.readFile(path.join(sessionIpcDirB, 'bound_session'), 'utf-8')
-        expect(boundA).toBe('claude-sess-A')
-        expect(boundB).toBe('claude-sess-B')
+        // Verify: A bound to first session, B to second
+        expect(getClaudeSessionBinding('claude-sess-A')).toBe(sessionId)
+        expect(getClaudeSessionBinding('claude-sess-B')).toBe(sessionIdB)
       })
 
-      it('routes permission requests to correct session IPC dir', async () => {
+      it('routes permission requests to correct session', async () => {
         const sessionIdB = 'test-session-uuid-B'
         const sessionIpcDirB = path.join(ipcDir, sessionIdB)
         await fs.mkdir(sessionIpcDirB, { recursive: true })
 
-        const statePath = path.join(tempDir, 'state.json')
-        const state = {
-          slots: {
-            1: {
-              sessionId,
-              projectName: 'project-A',
-              topicName: 'Project A',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            },
-            2: {
-              sessionId: sessionIdB,
-              projectName: 'project-B',
-              topicName: 'Project B',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            }
-          },
-          pendingStops: {}
+        // Add second session and pre-bind session B in SQLite
+        const dbResult = getDatabase()
+        expect(E.isRight(dbResult)).toBe(true)
+        if (E.isRight(dbResult)) {
+          insertSession(dbResult.right, sessionIdB, 2, 'project-B', new Date().toISOString())
+          updateSessionBinding(dbResult.right, sessionIdB, 'claude-sess-B')
         }
-        await fs.writeFile(statePath, JSON.stringify(state), 'utf-8')
-
-        // Pre-bind session B
-        await fs.writeFile(path.join(sessionIpcDirB, 'bound_session'), 'claude-sess-B', 'utf-8')
 
         // Session B sends permission request
         const hookArgs = {
@@ -430,20 +389,8 @@ describe('Hook Main Entry Point', () => {
           sessionId: 'claude-sess-B',
         }
 
-        // Simulate daemon response in session B's IPC dir
-        const responsePromise = (async () => {
-          await new Promise(resolve => setTimeout(resolve, 100))
-          try {
-            const requestId = await getRequestIdFromEventFiles(sessionIpcDirB)
-            if (requestId) {
-              await fs.writeFile(
-                path.join(sessionIpcDirB, `response-${requestId}.json`),
-                JSON.stringify({ approved: true }),
-                'utf-8'
-              )
-            }
-          } catch { /* ignore */ }
-        })()
+        // Simulate daemon response via SQLite
+        const responsePromise = simulateDaemonResponse(100, { approved: true })
 
         const result = await runHook(configPath, hookArgs)()
         await responsePromise
@@ -453,11 +400,9 @@ describe('Hook Main Entry Point', () => {
           expect(result.right).toBe(0) // approved
         }
 
-        // Verify: event files were written to session B's dir, NOT session A's
-        const hasEventsA = await hasEventFiles(sessionIpcDir)
-        const hasEventsB = await hasEventFiles(sessionIpcDirB)
-        expect(hasEventsA).toBe(false) // No events in A
-        expect(hasEventsB).toBe(true)  // Events in B
+        // Verify: events were written to session B, NOT session A
+        expect(countEventsForSession(sessionId)).toBe(0)
+        expect(countEventsForSession(sessionIdB)).toBeGreaterThan(0)
       })
 
       it('falls back to single active slot when no session_id', async () => {
@@ -481,30 +426,13 @@ describe('Hook Main Entry Point', () => {
 
       it('auto-approves when multiple slots active but no session_id', async () => {
         const sessionIdB = 'test-session-uuid-B'
-        const sessionIpcDirB = path.join(ipcDir, sessionIdB)
-        await fs.mkdir(sessionIpcDirB, { recursive: true })
 
-        const statePath = path.join(tempDir, 'state.json')
-        const state = {
-          slots: {
-            1: {
-              sessionId,
-              projectName: 'project-A',
-              topicName: 'Project A',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            },
-            2: {
-              sessionId: sessionIdB,
-              projectName: 'project-B',
-              topicName: 'Project B',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            }
-          },
-          pendingStops: {}
+        // Add second session to SQLite
+        const dbResult = getDatabase()
+        expect(E.isRight(dbResult)).toBe(true)
+        if (E.isRight(dbResult)) {
+          insertSession(dbResult.right, sessionIdB, 2, 'project-B', new Date().toISOString())
         }
-        await fs.writeFile(statePath, JSON.stringify(state), 'utf-8')
 
         // No sessionId + multiple slots = can't route safely → auto-approve
         const hookArgs = {
@@ -539,8 +467,8 @@ describe('Hook Main Entry Point', () => {
           expect(result.right).toBe(0)
         }
 
-        // Verify no events were written to IPC (no Telegram roundtrip)
-        expect(await hasEventFiles(sessionIpcDir)).toBe(false)
+        // Verify no events were written to SQLite (no Telegram roundtrip)
+        expect(countEventsForSession(sessionId)).toBe(0)
       })
 
       it('auto-approves Glob tool without Telegram roundtrip', async () => {
@@ -607,27 +535,15 @@ describe('Hook Main Entry Point', () => {
         }
 
         // Simulate daemon response so it doesn't hang
-        const responsePromise = (async () => {
-          await new Promise(resolve => setTimeout(resolve, 100))
-          try {
-            const requestId = await getRequestIdFromEventFiles(sessionIpcDir)
-            if (requestId) {
-              await fs.writeFile(
-                path.join(sessionIpcDir, `response-${requestId}.json`),
-                JSON.stringify({ approved: true }),
-                'utf-8'
-              )
-            }
-          } catch { /* ignore */ }
-        })()
+        const responsePromise = simulateDaemonResponse(100, { approved: true })
 
         const result = await runHook(configPath, hookArgs)()
         await responsePromise
 
         expect(E.isRight(result)).toBe(true)
 
-        // Verify events WERE written to IPC (Telegram roundtrip happened)
-        expect(await hasEventFiles(sessionIpcDir)).toBe(true)
+        // Verify events WERE written to SQLite (Telegram roundtrip happened)
+        expect(countEventsForSession(sessionId)).toBeGreaterThan(0)
       })
 
       it('still requires Telegram approval for Write', async () => {
@@ -697,7 +613,7 @@ describe('Hook Main Entry Point', () => {
         }
 
         // Verify no events were written (auto-approved, no Telegram roundtrip)
-        expect(await hasEventFiles(sessionIpcDir)).toBe(false)
+        expect(countEventsForSession(sessionId)).toBe(0)
       })
 
       it('auto-approves Write when whitelisted in autoApproveTools', async () => {
@@ -948,19 +864,7 @@ describe('Hook Main Entry Point', () => {
           sessionId: 'claude-sess-A',
         }
 
-        const responsePromise = (async () => {
-          await new Promise(resolve => setTimeout(resolve, 100))
-          try {
-            const requestId = await getRequestIdFromEventFiles(sessionIpcDir)
-            if (requestId) {
-              await fs.writeFile(
-                path.join(sessionIpcDir, `response-${requestId}.json`),
-                JSON.stringify({ approved: true }),
-                'utf-8'
-              )
-            }
-          } catch { /* ignore */ }
-        })()
+        const responsePromise = simulateDaemonResponse(100, { approved: true })
 
         const result = await runHook(configPath, hookArgs)()
         await responsePromise

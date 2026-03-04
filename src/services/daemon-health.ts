@@ -68,16 +68,15 @@ const HEARTBEAT_STALE_THRESHOLD_MS = 30_000
 // ============================================================================
 
 /**
- * Read daemon PID from state.json.
+ * Read daemon PID from daemon.pid file.
  * Returns null if not found or unreadable.
  */
 const readDaemonPid = async (configDir: string): Promise<number | null> => {
   try {
-    const statePath = path.join(configDir, 'state.json')
-    const content = await fs.readFile(statePath, 'utf-8')
-    const state = JSON.parse(content) as Record<string, unknown>
-    const pid = state['daemon_pid']
-    return typeof pid === 'number' ? pid : null
+    const pidPath = path.join(configDir, 'daemon.pid')
+    const content = await fs.readFile(pidPath, 'utf-8')
+    const pid = parseInt(content.trim(), 10)
+    return isNaN(pid) ? null : pid
   } catch {
     return null
   }
@@ -108,7 +107,7 @@ const readHeartbeat = async (configDir: string): Promise<number | null> => {
  * 4. Heartbeat older than threshold → Stale (daemon may be hung)
  * 5. Otherwise → Healthy
  *
- * @param configDir - Path to config directory containing state.json and daemon.heartbeat
+ * @param configDir - Path to config directory containing daemon.pid and daemon.heartbeat
  * @param now - Current timestamp in ms (injectable for testing)
  * @returns TaskEither<HookError, DaemonHealthStatus>
  */
@@ -150,18 +149,14 @@ export const checkDaemonHealth = (
 // ============================================================================
 
 /**
- * Update daemon_pid in state.json after a restart.
+ * Write daemon PID to daemon.pid file.
  */
 export const updateDaemonPidInState = async (configDir: string, pid: number): Promise<void> => {
-  const statePath = path.join(configDir, 'state.json')
+  const pidPath = path.join(configDir, 'daemon.pid')
   try {
-    const content = await fs.readFile(statePath, 'utf-8')
-    const state = JSON.parse(content) as Record<string, unknown>
-    state['daemon_pid'] = pid
-    state['daemon_heartbeat'] = Date.now() / 1000
-    await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf-8')
+    await fs.writeFile(pidPath, String(pid), 'utf-8')
   } catch (error) {
-    console.error(`[daemon-health] Failed to update daemon PID in state: ${String(error)}`)
+    console.error(`[daemon-health] Failed to write daemon PID: ${String(error)}`)
   }
 }
 
@@ -173,7 +168,7 @@ export const updateDaemonPidInState = async (configDir: string, pid: number): Pr
  * Check daemon health and restart if dead or stale.
  * Returns true if daemon is healthy (or was successfully restarted), false if unrecoverable.
  *
- * @param configDir - Path to config directory containing state.json, bridge.js, daemon.log
+ * @param configDir - Path to config directory containing daemon.pid, bridge.js, daemon.log
  * @returns Promise<boolean> - true if daemon is alive, false if restart failed
  */
 export const ensureDaemonAlive = async (configDir: string): Promise<boolean> => {

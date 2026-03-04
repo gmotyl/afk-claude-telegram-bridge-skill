@@ -25,7 +25,7 @@ npx jest --testPathPattern="permission"
 ## Architecture
 
 ```
-Claude Code ←→ hook.sh ←→ hook.js ←→ IPC (filesystem) ←→ bridge.js daemon ←→ Telegram API
+Claude Code ←→ hook.sh ←→ hook.js ←→ SQLite (bridge.db) ←→ bridge.js daemon ←→ Telegram API
 ```
 
 **Three entry points** built by esbuild (`build.mjs`) into self-contained Node.js bundles with shebangs:
@@ -38,14 +38,14 @@ Claude Code ←→ hook.sh ←→ hook.js ←→ IPC (filesystem) ←→ bridge.
 
 **Layered architecture:**
 - `src/core/` — Pure business logic, no I/O. State transformations return `Either<Error, State>`.
-- `src/services/` — I/O operations (filesystem IPC, Telegram API, file locking, daemon lifecycle).
+- `src/services/` — I/O operations (SQLite IPC, Telegram API, daemon lifecycle).
 - `src/hook/`, `src/bridge/`, `src/cli/` — Orchestration layers that compose core + services.
 
-**IPC mechanism:** File-based JSONL event queue (`ipc/{sessionId}/events.jsonl`). Hook writes events, daemon reads them. Async responses via `response-{eventId}.json` files that hooks poll for.
+**IPC mechanism:** SQLite database (`bridge.db`) with WAL mode. Hook writes events to `events` table, daemon reads and marks processed. Responses via `responses` table that hooks poll.
 
-**Session isolation:** Multiple concurrent Claude sessions (up to 4 slots). Each session binds to an IPC directory via `bound_session` file on first hook event. All subsequent hooks route through that binding.
+**Session isolation:** Multiple concurrent Claude sessions (up to 4 slots). Each session binds via `claude_session_id` column in `sessions` table on first hook event. All subsequent hooks route through that binding.
 
-**Active listening loop (Stop hook):** When Claude finishes, the Stop hook enters a polling loop waiting for Telegram instructions. Daemon delivers instructions via response files. Loop continues until user clicks "Let it stop".
+**Active listening loop (Stop hook):** When Claude finishes, the Stop hook enters a polling loop waiting for Telegram instructions. Daemon delivers instructions via SQLite responses. Loop continues until user clicks "Let it stop".
 
 ## Key Patterns
 
@@ -53,7 +53,7 @@ Claude Code ←→ hook.sh ←→ hook.js ←→ IPC (filesystem) ←→ bridge.
 
 **Tagged discriminated unions:** Events (`src/types/events.ts`) and errors (`src/types/errors.ts`) use `_tag` field for exhaustive `switch` pattern matching. Smart constructors for all variants.
 
-**Immutable state:** All types use `readonly`. State updates via spread operator. State file protected by `proper-lockfile` for cross-process safety.
+**Immutable state:** All types use `readonly`. State updates via spread operator. SQLite handles cross-process concurrency via WAL mode.
 
 ## TypeScript Config
 
@@ -66,10 +66,12 @@ Tests live in `__tests__/` directories adjacent to source. Uses `ts-jest` preset
 ## Runtime Files
 
 Installed to `~/.claude/hooks/telegram-bridge/`:
-- `state.json` — Slot allocations and pending stops (lockfile-protected)
+- `bridge.db` — SQLite database (sessions, events, responses, pending_stops, known_topics)
 - `config.json` — Bot token, group ID, timeouts
-- `ipc/{sessionId}/` — Per-session event queues and response files
-- `daemon.log` / `hook-debug.log` — Debug logs
+- `daemon.pid` — Running daemon PID
+- `daemon.heartbeat` — Daemon heartbeat timestamp
+- `daemon.log` — Daemon debug logs
+- `ipc/{sessionId}/` — Signal files (kill, force_clear)
 
 <!-- gitnexus:start -->
 # GitNexus MCP

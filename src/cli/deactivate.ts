@@ -1,21 +1,31 @@
 /**
  * @module cli/deactivate
- * Deactivate AFK mode: write SessionEnd, release slot, clean IPC, stop daemon if last.
+ * Deactivate AFK mode: release slot, delete session from SQLite (CASCADE), stop daemon if last.
  */
 
 import * as E from 'fp-ts/Either'
 import * as TE from 'fp-ts/TaskEither'
-import { pipe } from 'fp-ts/function'
 import * as path from 'path'
-import { type State } from '../types/state'
+import * as fs from 'fs/promises'
 import { type BridgeError, cliError } from '../types/errors'
+import { dbErrorMessage } from '../types/db'
 import { loadConfig } from '../core/config'
-import { loadState, saveState } from '../services/state-persistence'
-import { withStateLock } from '../services/file-lock'
-import { findSlotBySessionId, removeSlot } from '../core/state'
-import { removeIpcDir } from '../services/ipc'
+import { loadState } from '../services/state-persistence-sqlite'
+import { findSlotBySessionId } from '../core/state'
 import { stopDaemon, isDaemonAlive } from '../services/daemon-launcher'
 import { sendMessageToTopic, deleteForumTopic } from '../services/telegram'
+import { openDatabase, getDatabase } from '../services/db'
+import { deleteSession } from '../services/db-queries'
+
+const readDaemonPidFromFile = async (configDir: string): Promise<number | null> => {
+  try {
+    const content = await fs.readFile(path.join(configDir, 'daemon.pid'), 'utf-8')
+    const pid = parseInt(content.trim(), 10)
+    return isNaN(pid) ? null : pid
+  } catch {
+    return null
+  }
+}
 
 export const deactivate = (
   configDir: string,
@@ -30,14 +40,21 @@ export const deactivate = (
   }
   const config = configResult.right
 
-  return pipe(
-    withStateLock(statePath, async () => {
-      // 1. Load state
+  // Open SQLite database
+  const dbPath = path.join(configDir, 'bridge.db')
+  const dbResult = openDatabase(dbPath)
+  if (E.isLeft(dbResult)) {
+    return TE.left(cliError(`Failed to open database: ${dbErrorMessage(dbResult.left)}`, 'deactivate'))
+  }
+
+  return TE.tryCatch(
+    async () => {
+      // 1. Load state from SQLite
       const stateResult = await loadState(statePath)()
       if (E.isLeft(stateResult)) {
         throw new Error(`Failed to load state: ${stateResult.left.message}`)
       }
-      let state = stateResult.right
+      const state = stateResult.right
 
       // 2. Find slot by sessionId (or first active if no exact match)
       let slotNum: number
@@ -66,35 +83,25 @@ export const deactivate = (
         await deleteForumTopic(token, chatId, slot.threadId)()
       }
 
-      // 4. Remove slot from state
-      state = removeSlot(state, slotNum)
-
-      // 5. Save state
-      const saveResult = await saveState(statePath, state)()
-      if (E.isLeft(saveResult)) {
-        throw new Error(`Failed to save state: ${saveResult.left.message}`)
+      // 4. Delete session from SQLite (CASCADE clears events, responses, batches, pending_stops)
+      const dbRef = getDatabase()
+      if (E.isRight(dbRef)) {
+        deleteSession(dbRef.right, slotSessionId)
       }
 
-      // 6. Clean IPC dir (safe now since we handled Telegram directly)
-      await removeIpcDir(config.ipcBaseDir, slotSessionId)()
+      // 5. Check if any slots remain after deletion
+      const remainingState = await loadState(statePath)()
+      const hasActiveSlots = E.isRight(remainingState) &&
+        Object.values(remainingState.right.slots).some(s => s !== undefined)
 
-      // 7. Stop daemon if no slots remain
-      const hasActiveSlots = Object.values(state.slots).some(s => s !== undefined)
+      // 6. Stop daemon if no slots remain
       if (!hasActiveSlots) {
-        const stateObj = state as unknown as Record<string, unknown>
-        const daemonPid = stateObj['daemon_pid'] as number | undefined
-        if (daemonPid && isDaemonAlive(daemonPid)) {
+        const daemonPid = await readDaemonPidFromFile(configDir)
+        if (daemonPid !== null && isDaemonAlive(daemonPid)) {
           await stopDaemon(daemonPid)()
-          // Clear daemon PID from state
-          delete stateObj['daemon_pid']
-          delete stateObj['daemon_heartbeat']
-          await saveState(statePath, stateObj as unknown as State)()
         }
       }
-    }),
-    TE.mapLeft((lockErr) => {
-      if (lockErr._tag === 'LockError') return lockErr as BridgeError
-      return cliError(String(lockErr), 'deactivate') as BridgeError
-    })
+    },
+    (err) => cliError(String(err), 'deactivate') as BridgeError
   )
 }

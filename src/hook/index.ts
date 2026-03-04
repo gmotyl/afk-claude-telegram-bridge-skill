@@ -26,9 +26,10 @@ import { requestPermission, type PermissionResponse } from './permission'
 import { handleStopRequest, type StopDecision } from './stop'
 import { loadConfig } from '../core/config'
 import { Config } from '../types/config'
-import { loadState } from '../services/state-persistence'
-import { findBoundSession, findUnboundSession, bindSession } from '../services/session-binding'
+import { loadState } from '../services/state-persistence-sqlite'
+import { findBoundSession, findUnboundSession, bindSession } from '../services/session-binding-sqlite'
 import { ensureDaemonAlive } from '../services/daemon-health'
+import { openDatabase, closeDatabase } from '../services/db'
 import { type HookError, hookError } from '../types/errors'
 
 // ============================================================================
@@ -50,7 +51,7 @@ interface ResolvedSession {
 /**
  * Resolve which AFK session this hook call belongs to.
  *
- * Uses session binding (bound_session files in IPC dirs) to map
+ * Uses session binding (SQLite sessions.claude_session_id) to map
  * Claude Code's session_id to the correct AFK session.
  *
  * @param ipcBaseDir - Base IPC directory
@@ -88,18 +89,20 @@ const resolveSession = async (
     }
   }
 
-  // Fallback: if only one slot is active and no session_id available, use it
-  // (backwards compatibility for CLI args mode)
-  const activeSlots = Object.entries(slots).filter(([, s]) => s !== undefined)
-  if (activeSlots.length === 1 && activeSlots[0]) {
-    const [slotKey, slot] = activeSlots[0]
-    return {
-      sessionId: slot!.sessionId,
-      slotNum: parseInt(slotKey, 10)
+  // Fallback: only when no session_id available (CLI args mode)
+  // If we had a claudeSessionId but it didn't match, return null — this
+  // session is NOT an AFK session and should not be routed through the bridge.
+  if (!claudeSessionId) {
+    const activeSlots = Object.entries(slots).filter(([, s]) => s !== undefined)
+    if (activeSlots.length === 1 && activeSlots[0]) {
+      const [slotKey, slot] = activeSlots[0]
+      return {
+        sessionId: slot!.sessionId,
+        slotNum: parseInt(slotKey, 10)
+      }
     }
   }
 
-  // Multiple slots active but no session_id — can't route safely
   return null
 }
 
@@ -137,16 +140,35 @@ export const runHook = (
       }
       const config = configResult.right
 
-      // Step 3: Resolve session via binding
+      // Step 2b: Open SQLite database for IPC
       const configDir = path.dirname(configPath)
+      const dbPath = path.join(configDir, 'bridge.db')
+      const dbResult = openDatabase(dbPath)
+      if (E.isLeft(dbResult)) {
+        console.error(`[hook] Failed to open SQLite database: ${String(dbResult.left)}`)
+        // Without DB, we can't resolve sessions — auto-approve permissions, let stop proceed
+        if (hookArgs.type === 'permission_request') {
+          process.stdout.write(JSON.stringify({
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              permissionDecision: 'allow',
+            }
+          }))
+        }
+        return 0
+      }
+
+      // Step 3: Resolve session via binding
       const statePath = path.join(configDir, 'state.json')
 
       // Use session_id from hookArgs (stdin JSON) or env fallback
       const claudeSessionId = hookArgs.sessionId || process.env.CLAUDE_SESSION_ID
+      console.error(`[hook] Resolving session for claude_session_id=${claudeSessionId?.slice(0,8) ?? 'none'}, type=${hookArgs.type}`)
       const resolved = await resolveSession(config.ipcBaseDir, statePath, claudeSessionId)
 
       // If no resolved session, auto-approve (no active AFK)
       if (!resolved) {
+        console.error(`[hook] No resolved session — ${hookArgs.type === 'stop' ? 'letting stop proceed' : 'auto-approving'}`)
         if (hookArgs.type === 'permission_request') {
           // Auto-approve: output allow decision
           process.stdout.write(JSON.stringify({
@@ -407,6 +429,9 @@ const main = async (): Promise<void> => {
   }
 
   const result = await runHook(configPath, argsOrHookArgs)()
+
+  // Always close SQLite database before exiting
+  closeDatabase()
 
   if (E.isLeft(result)) {
     const error = result.left
