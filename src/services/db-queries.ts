@@ -1,4 +1,4 @@
-import * as Database from 'better-sqlite3'
+import Database from 'better-sqlite3'
 import * as E from 'fp-ts/Either'
 import { DbError, queryError, constraintError } from '../types/db'
 
@@ -130,10 +130,9 @@ export const incrementApprovalCount = (
   sessionId: string
 ): E.Either<DbError, number> =>
   tryCatch(() => {
-    db.prepare('UPDATE sessions SET approval_count = approval_count + 1 WHERE id = ?').run(sessionId)
-    const row = db.prepare('SELECT approval_count FROM sessions WHERE id = ?').get(sessionId) as
-      | { approval_count: number }
-      | undefined
+    const row = db
+      .prepare('UPDATE sessions SET approval_count = approval_count + 1 WHERE id = ? RETURNING approval_count')
+      .get(sessionId) as { approval_count: number } | undefined
     return row?.approval_count ?? 0
   }, 'incrementApprovalCount')
 

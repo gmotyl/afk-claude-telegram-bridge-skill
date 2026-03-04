@@ -1,5 +1,5 @@
 import * as E from 'fp-ts/Either'
-import * as Database from 'better-sqlite3'
+import Database from 'better-sqlite3'
 import {
   insertSession,
   findSessionBySlot,

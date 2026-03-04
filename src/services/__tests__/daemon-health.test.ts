@@ -33,10 +33,10 @@ describe('checkDaemonHealth', () => {
     await fs.rm(configDir, { recursive: true, force: true }).catch(() => {})
   })
 
-  const writeState = async (state: Record<string, unknown>): Promise<void> => {
+  const writePid = async (pid: number): Promise<void> => {
     await fs.writeFile(
-      path.join(configDir, 'state.json'),
-      JSON.stringify(state),
+      path.join(configDir, 'daemon.pid'),
+      String(pid),
       'utf-8'
     )
   }
@@ -49,7 +49,7 @@ describe('checkDaemonHealth', () => {
     )
   }
 
-  it('returns DaemonDead when no state.json exists (no PID)', async () => {
+  it('returns DaemonDead when no daemon.pid exists', async () => {
     const result = await checkDaemonHealth(configDir)()
 
     expect(E.isRight(result)).toBe(true)
@@ -62,8 +62,8 @@ describe('checkDaemonHealth', () => {
     }
   })
 
-  it('returns DaemonDead when state.json has no daemon_pid', async () => {
-    await writeState({ slots: {} })
+  it('returns DaemonDead when daemon.pid contains non-numeric content', async () => {
+    await fs.writeFile(path.join(configDir, 'daemon.pid'), 'not-a-number', 'utf-8')
 
     const result = await checkDaemonHealth(configDir)()
 
@@ -77,7 +77,7 @@ describe('checkDaemonHealth', () => {
   })
 
   it('returns DaemonDead when PID is not alive', async () => {
-    await writeState({ daemon_pid: 99999 })
+    await writePid(99999)
     mockedIsDaemonAlive.mockReturnValue(false)
 
     const result = await checkDaemonHealth(configDir)()
@@ -93,7 +93,7 @@ describe('checkDaemonHealth', () => {
   })
 
   it('returns DaemonDead when PID alive but no heartbeat file', async () => {
-    await writeState({ daemon_pid: 12345 })
+    await writePid(12345)
     mockedIsDaemonAlive.mockReturnValue(true)
 
     const result = await checkDaemonHealth(configDir)()
@@ -112,7 +112,7 @@ describe('checkDaemonHealth', () => {
     const now = Date.now()
     const staleHeartbeat = now - 60_000 // 60s old
 
-    await writeState({ daemon_pid: 12345 })
+    await writePid(12345)
     mockedIsDaemonAlive.mockReturnValue(true)
     await writeHeartbeat(staleHeartbeat)
 
@@ -132,7 +132,7 @@ describe('checkDaemonHealth', () => {
     const now = Date.now()
     const freshHeartbeat = now - 5_000 // 5s old
 
-    await writeState({ daemon_pid: 12345 })
+    await writePid(12345)
     mockedIsDaemonAlive.mockReturnValue(true)
     await writeHeartbeat(freshHeartbeat)
 
@@ -153,7 +153,7 @@ describe('checkDaemonHealth', () => {
     // Heartbeat at exactly 29s ago (under 30s threshold)
     const heartbeat = now - 29_000
 
-    await writeState({ daemon_pid: 12345 })
+    await writePid(12345)
     mockedIsDaemonAlive.mockReturnValue(true)
     await writeHeartbeat(heartbeat)
 
@@ -166,7 +166,7 @@ describe('checkDaemonHealth', () => {
   })
 
   it('handles corrupted heartbeat file gracefully', async () => {
-    await writeState({ daemon_pid: 12345 })
+    await writePid(12345)
     mockedIsDaemonAlive.mockReturnValue(true)
     await fs.writeFile(path.join(configDir, 'daemon.heartbeat'), 'not-a-number', 'utf-8')
 
@@ -179,8 +179,8 @@ describe('checkDaemonHealth', () => {
     }
   })
 
-  it('handles corrupted state.json gracefully', async () => {
-    await fs.writeFile(path.join(configDir, 'state.json'), 'not-json', 'utf-8')
+  it('handles empty daemon.pid file gracefully', async () => {
+    await fs.writeFile(path.join(configDir, 'daemon.pid'), '', 'utf-8')
 
     const result = await checkDaemonHealth(configDir)()
 
@@ -207,10 +207,10 @@ describe('ensureDaemonAlive', () => {
     await fs.rm(configDir, { recursive: true, force: true }).catch(() => {})
   })
 
-  const writeState = async (state: Record<string, unknown>): Promise<void> => {
+  const writePid = async (pid: number): Promise<void> => {
     await fs.writeFile(
-      path.join(configDir, 'state.json'),
-      JSON.stringify(state),
+      path.join(configDir, 'daemon.pid'),
+      String(pid),
       'utf-8'
     )
   }
@@ -225,7 +225,7 @@ describe('ensureDaemonAlive', () => {
 
   it('returns true when daemon is healthy (no restart)', async () => {
     const now = Date.now()
-    await writeState({ daemon_pid: 12345 })
+    await writePid(12345)
     mockedIsDaemonAlive.mockReturnValue(true)
     await writeHeartbeat(now - 5_000)
 
@@ -236,7 +236,7 @@ describe('ensureDaemonAlive', () => {
   })
 
   it('restarts dead daemon and returns true on success', async () => {
-    await writeState({ daemon_pid: 99999 })
+    await writePid(99999)
     mockedIsDaemonAlive.mockReturnValue(false)
     mockedStartDaemon.mockReturnValue(TE.right(54321))
 
@@ -245,15 +245,14 @@ describe('ensureDaemonAlive', () => {
     expect(result).toBe(true)
     expect(mockedStartDaemon).toHaveBeenCalledTimes(1)
 
-    // Verify PID was updated in state
-    const stateContent = await fs.readFile(path.join(configDir, 'state.json'), 'utf-8')
-    const state = JSON.parse(stateContent) as Record<string, unknown>
-    expect(state['daemon_pid']).toBe(54321)
+    // Verify PID was updated in daemon.pid
+    const pidContent = await fs.readFile(path.join(configDir, 'daemon.pid'), 'utf-8')
+    expect(parseInt(pidContent.trim(), 10)).toBe(54321)
   })
 
   it('restarts stale daemon and returns true on success', async () => {
     const now = Date.now()
-    await writeState({ daemon_pid: 12345 })
+    await writePid(12345)
     mockedIsDaemonAlive.mockReturnValue(true)
     await writeHeartbeat(now - 60_000) // stale
     mockedStartDaemon.mockReturnValue(TE.right(54321))
@@ -265,7 +264,7 @@ describe('ensureDaemonAlive', () => {
   })
 
   it('returns false when restart fails', async () => {
-    await writeState({ daemon_pid: 99999 })
+    await writePid(99999)
     mockedIsDaemonAlive.mockReturnValue(false)
     mockedStartDaemon.mockReturnValue(
       TE.left({ _tag: 'DaemonSpawnError' as const, message: 'spawn failed' })
@@ -278,7 +277,7 @@ describe('ensureDaemonAlive', () => {
   })
 
   it('returns false when health check itself fails', async () => {
-    // No state.json + no heartbeat → DaemonDead → restart attempt
+    // No daemon.pid + no heartbeat → DaemonDead → restart attempt
     // startDaemon fails → returns false
     mockedStartDaemon.mockReturnValue(
       TE.left({ _tag: 'DaemonSpawnError' as const, message: 'no bridge.js' })
@@ -301,23 +300,24 @@ describe('updateDaemonPidInState', () => {
     await fs.rm(configDir, { recursive: true, force: true }).catch(() => {})
   })
 
-  it('updates daemon_pid and daemon_heartbeat in state.json', async () => {
-    await fs.writeFile(
-      path.join(configDir, 'state.json'),
-      JSON.stringify({ daemon_pid: 111, slots: {} }),
-      'utf-8'
-    )
-
+  it('writes PID to daemon.pid file', async () => {
     await updateDaemonPidInState(configDir, 222)
 
-    const content = await fs.readFile(path.join(configDir, 'state.json'), 'utf-8')
-    const state = JSON.parse(content) as Record<string, unknown>
-    expect(state['daemon_pid']).toBe(222)
-    expect(typeof state['daemon_heartbeat']).toBe('number')
+    const content = await fs.readFile(path.join(configDir, 'daemon.pid'), 'utf-8')
+    expect(parseInt(content.trim(), 10)).toBe(222)
   })
 
-  it('does not throw when state.json does not exist', async () => {
-    // Should not throw — logs error internally
-    await expect(updateDaemonPidInState(configDir, 333)).resolves.toBeUndefined()
+  it('overwrites existing daemon.pid', async () => {
+    await fs.writeFile(path.join(configDir, 'daemon.pid'), '111', 'utf-8')
+
+    await updateDaemonPidInState(configDir, 333)
+
+    const content = await fs.readFile(path.join(configDir, 'daemon.pid'), 'utf-8')
+    expect(parseInt(content.trim(), 10)).toBe(333)
+  })
+
+  it('does not throw when directory does not exist', async () => {
+    const badDir = path.join(configDir, 'nonexistent')
+    await expect(updateDaemonPidInState(badDir, 444)).resolves.toBeUndefined()
   })
 })

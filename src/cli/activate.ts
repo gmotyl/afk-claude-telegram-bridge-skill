@@ -1,22 +1,24 @@
 /**
  * @module cli/activate
- * Activate AFK mode: claim slot, create IPC dir, write SessionStart, start daemon.
+ * Activate AFK mode: claim slot, insert session into SQLite, write SessionStart, start daemon.
  */
 
 import * as E from 'fp-ts/Either'
 import * as TE from 'fp-ts/TaskEither'
-import { pipe } from 'fp-ts/function'
 import * as path from 'path'
-import { type Config } from '../types/config'
-import { type State, type Slot } from '../types/state'
+import * as fs from 'fs/promises'
+import { type Slot } from '../types/state'
 import { type BridgeError, cliError } from '../types/errors'
+import { dbErrorMessage } from '../types/db'
 import { loadConfig } from '../core/config'
-import { loadState, saveState } from '../services/state-persistence'
-import { withStateLock } from '../services/file-lock'
+import { loadState } from '../services/state-persistence-sqlite'
 import { cleanupStaleSlots, findAvailableSlot, findSlotByTopicName, addSlot, removeSlot } from '../core/state'
-import { createIpcDir, writeMetaFile, writeEvent, removeIpcDir } from '../services/ipc'
+import { createIpcDir, writeMetaFile, writeEvent, removeIpcDir } from '../services/ipc-sqlite'
 import { sessionStart } from '../types/events'
 import { startDaemon, isDaemonAlive } from '../services/daemon-launcher'
+import { updateDaemonPidInState } from '../services/daemon-health'
+import { openDatabase, getDatabase } from '../services/db'
+import { insertSession, deleteSession, updateSessionThreadId } from '../services/db-queries'
 
 export interface ActivateResult {
   readonly slotNum: number
@@ -24,6 +26,17 @@ export interface ActivateResult {
   readonly topicName: string
   readonly threadId?: number
   readonly daemonPid: number
+}
+
+const readDaemonPidFromState = async (configDir: string): Promise<number | null> => {
+  try {
+    const pidPath = path.join(configDir, 'daemon.pid')
+    const content = await fs.readFile(pidPath, 'utf-8')
+    const pid = parseInt(content.trim(), 10)
+    return isNaN(pid) ? null : pid
+  } catch {
+    return null
+  }
 }
 
 export const activate = (
@@ -45,9 +58,16 @@ export const activate = (
   }
   const config = configResult.right
 
-  return pipe(
-    withStateLock(statePath, async () => {
-      // 1. Load state
+  // Open SQLite database
+  const dbPath = path.join(configDir, 'bridge.db')
+  const dbResult = openDatabase(dbPath)
+  if (E.isLeft(dbResult)) {
+    return TE.left(cliError(`Failed to open database: ${dbErrorMessage(dbResult.left)}`, 'activate'))
+  }
+
+  return TE.tryCatch(
+    async () => {
+      // 1. Load state from SQLite
       const stateResult = await loadState(statePath)()
       if (E.isLeft(stateResult)) {
         throw new Error(`Failed to load state: ${stateResult.left.message}`)
@@ -65,9 +85,12 @@ export const activate = (
         const [oldSlotNum, oldSlot] = existingSlot
         reattachThreadId = oldSlot.threadId
         preferredSlot = oldSlotNum
-        // Remove old slot and clean its IPC dir
+        // Remove old slot from state and SQLite
         state = removeSlot(state, oldSlotNum)
-        await removeIpcDir(config.ipcBaseDir, oldSlot.sessionId)()
+        const dbRef = getDatabase()
+        if (E.isRight(dbRef)) {
+          deleteSession(dbRef.right, oldSlot.sessionId)
+        }
       }
 
       // 4. Find available slot
@@ -93,61 +116,42 @@ export const activate = (
       }
       state = addResult.right
 
-      // 6. Save state
-      const saveResult = await saveState(statePath, state)()
-      if (E.isLeft(saveResult)) {
-        throw new Error(`Failed to save state: ${saveResult.left.message}`)
+      // 6. Insert session into SQLite
+      const dbRef = getDatabase()
+      if (E.isRight(dbRef)) {
+        const insertResult = insertSession(dbRef.right, sessionId, slotNum, project, new Date().toISOString())
+        if (E.isLeft(insertResult)) {
+          throw new Error(`Failed to insert session: ${String(insertResult.left)}`)
+        }
+        // Set threadId if reattaching
+        if (reattachThreadId !== undefined) {
+          updateSessionThreadId(dbRef.right, sessionId, reattachThreadId)
+        }
       }
 
-      // 7. Create IPC dir + meta.json
-      const ipcDirResult = await createIpcDir(config.ipcBaseDir, sessionId)()
-      if (E.isLeft(ipcDirResult)) {
-        throw new Error('Failed to create IPC directory')
-      }
-      const ipcDir = ipcDirResult.right
-
-      await writeMetaFile(ipcDir, {
-        sessionId,
-        project,
-        topicName,
-        slotNum,
-        activatedAt: new Date().toISOString(),
-      })()
-
-      // 8. Write SessionStart event
-      const eventsFile = path.join(ipcDir, `event-S${slotNum}.jsonl`)
+      // 7. Write SessionStart event to SQLite
+      const eventsFile = path.join(config.ipcBaseDir, sessionId, `event-S${slotNum}.jsonl`)
       await writeEvent(eventsFile, sessionStart(slotNum, sessionId, project, topicName, reattachThreadId))()
 
-      // 9. Start daemon if not alive
+      // 8. Start daemon if not alive
       let daemonPid: number
-      const stateForDaemon = await loadState(statePath)()
-      const currentState = E.isRight(stateForDaemon) ? stateForDaemon.right : state
-      const daemonPidFromState = (currentState as Record<string, unknown>)['daemon_pid'] as number | undefined
 
-      if (daemonPidFromState && isDaemonAlive(daemonPidFromState)) {
-        daemonPid = daemonPidFromState
+      // Check for existing daemon via PID in daemon.pid
+      const existingPid = await readDaemonPidFromState(configDir)
+      if (existingPid !== null && isDaemonAlive(existingPid)) {
+        daemonPid = existingPid
       } else {
         const spawnResult = await startDaemon(bridgePath, configDir, logPath)()
         if (E.isLeft(spawnResult)) {
           throw new Error(`Failed to start daemon: ${spawnResult.left.message}`)
         }
         daemonPid = spawnResult.right
-
-        // Save daemon PID to state
-        const stateWithPid = await loadState(statePath)()
-        if (E.isRight(stateWithPid)) {
-          const stateObj = stateWithPid.right as unknown as Record<string, unknown>
-          stateObj['daemon_pid'] = daemonPid
-          stateObj['daemon_heartbeat'] = Date.now() / 1000
-          await saveState(statePath, stateObj as unknown as State)()
-        }
+        // Persist PID so hooks can find the daemon
+        await updateDaemonPidInState(configDir, daemonPid)
       }
 
       return { slotNum, sessionId, topicName, threadId: reattachThreadId, daemonPid } as ActivateResult
-    }),
-    TE.mapLeft((lockErr) => {
-      if (lockErr._tag === 'LockError') return lockErr as BridgeError
-      return cliError(String(lockErr), 'activate') as BridgeError
-    })
+    },
+    (err) => cliError(String(err), 'activate') as BridgeError
   )
 }

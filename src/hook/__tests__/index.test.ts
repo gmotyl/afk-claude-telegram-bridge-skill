@@ -1,6 +1,6 @@
 /**
  * @module hook/index.test
- * Tests for hook main entry point with session binding
+ * Tests for hook main entry point with session binding (SQLite-backed)
  */
 
 import * as E from 'fp-ts/Either'
@@ -15,8 +15,8 @@ jest.mock('../../services/daemon-health', () => ({
 }))
 
 import { runHook } from '../index'
-import { closeDatabase, getDatabase } from '../../services/db'
-import { insertResponse } from '../../services/db-queries'
+import { openDatabase, closeDatabase, getDatabase } from '../../services/db'
+import { insertSession, insertResponse, updateSessionBinding, findSessionByClaudeId } from '../../services/db-queries'
 
 // ============================================================================
 // SQLite daemon simulation helpers
@@ -63,7 +63,7 @@ const simulateDaemonResponse = (delayMs: number, responsePayload: Record<string,
     }
   })()
 
-/** Helper: create a test environment with config, state, and per-session IPC dir */
+/** Helper: create a test environment with config and SQLite-backed session */
 const createTestEnv = async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'hook-index-test-'))
   const ipcDir = path.join(tempDir, 'ipc')
@@ -82,23 +82,35 @@ const createTestEnv = async () => {
   const configPath = path.join(tempDir, 'config.json')
   await fs.writeFile(configPath, JSON.stringify(config), 'utf-8')
 
-  // Create state.json with one active slot
-  const state = {
-    slots: {
-      1: {
-        sessionId,
-        projectName: 'test-project',
-        topicName: 'Test Project',
-        activatedAt: new Date().toISOString(),
-        lastHeartbeat: new Date().toISOString(),
-      }
-    },
-    pendingStops: {}
-  }
-  const statePath = path.join(tempDir, 'state.json')
-  await fs.writeFile(statePath, JSON.stringify(state), 'utf-8')
+  // Open SQLite database at the same path runHook will use
+  const dbPath = path.join(tempDir, 'bridge.db')
+  const dbResult = openDatabase(dbPath)
+  if (E.isLeft(dbResult)) throw new Error('Failed to open test database')
+  const db = dbResult.right
 
-  return { tempDir, ipcDir, sessionIpcDir, sessionId, configPath, statePath }
+  // Insert session into SQLite (replaces state.json)
+  const insertResult = insertSession(db, sessionId, 1, 'test-project', new Date().toISOString())
+  expect(E.isRight(insertResult)).toBe(true)
+
+  return { tempDir, ipcDir, sessionIpcDir, sessionId, configPath, dbPath }
+}
+
+/** Helper: clear all sessions from SQLite (for "no active session" tests) */
+const clearSessions = () => {
+  const dbResult = getDatabase()
+  if (E.isRight(dbResult)) {
+    dbResult.right.prepare('DELETE FROM sessions').run()
+  }
+}
+
+/** Helper: check claude_session_id binding in SQLite */
+const getClaudeSessionBinding = (claudeSessionId: string): string | null => {
+  const dbResult = getDatabase()
+  if (E.isLeft(dbResult)) return null
+
+  const result = findSessionByClaudeId(dbResult.right, claudeSessionId)
+  if (E.isLeft(result) || !result.right) return null
+  return result.right.id
 }
 
 describe('Hook Main Entry Point', () => {
@@ -242,9 +254,8 @@ describe('Hook Main Entry Point', () => {
 
     describe('no active AFK session', () => {
       it('auto-approves permission_request when no active slots (outputs allow JSON)', async () => {
-        // Overwrite state with empty slots
-        const statePath = path.join(tempDir, 'state.json')
-        await fs.writeFile(statePath, JSON.stringify({ slots: {}, pendingStops: {} }), 'utf-8')
+        // Clear all sessions from SQLite (no active slots)
+        clearSessions()
 
         const hookArgs = {
           type: 'permission_request' as const,
@@ -262,8 +273,8 @@ describe('Hook Main Entry Point', () => {
       })
 
       it('passes stop when no active slots (no JSON output)', async () => {
-        const statePath = path.join(tempDir, 'state.json')
-        await fs.writeFile(statePath, JSON.stringify({ slots: {}, pendingStops: {} }), 'utf-8')
+        // Clear all sessions from SQLite
+        clearSessions()
 
         const hookArgs = {
           type: 'stop' as const,
@@ -281,7 +292,7 @@ describe('Hook Main Entry Point', () => {
     })
 
     describe('session binding', () => {
-      it('creates bound_session file on first hook call', async () => {
+      it('binds claude_session_id in SQLite on first hook call', async () => {
         const hookArgs = {
           type: 'notification' as const,
           message: 'test',
@@ -290,16 +301,18 @@ describe('Hook Main Entry Point', () => {
 
         await runHook(configPath, hookArgs)()
 
-        // Check that bound_session file was created
-        const boundFile = path.join(sessionIpcDir, 'bound_session')
-        const content = await fs.readFile(boundFile, 'utf-8')
-        expect(content).toBe('claude-sess-X')
+        // Check that claude_session_id was set in SQLite
+        const boundSessionId = getClaudeSessionBinding('claude-sess-X')
+        expect(boundSessionId).toBe(sessionId)
       })
 
       it('reuses existing binding on subsequent calls', async () => {
-        // Pre-create binding
-        const boundFile = path.join(sessionIpcDir, 'bound_session')
-        await fs.writeFile(boundFile, 'claude-sess-Y', 'utf-8')
+        // Pre-create binding in SQLite
+        const dbResult = getDatabase()
+        expect(E.isRight(dbResult)).toBe(true)
+        if (E.isRight(dbResult)) {
+          updateSessionBinding(dbResult.right, sessionId, 'claude-sess-Y')
+        }
 
         // Kill file in session dir for quick stop exit
         await fs.writeFile(path.join(sessionIpcDir, 'kill'), '', 'utf-8')
@@ -318,37 +331,21 @@ describe('Hook Main Entry Point', () => {
         }
 
         // Verify binding wasn't changed
-        const content = await fs.readFile(boundFile, 'utf-8')
-        expect(content).toBe('claude-sess-Y')
+        const boundSessionId = getClaudeSessionBinding('claude-sess-Y')
+        expect(boundSessionId).toBe(sessionId)
       })
 
-      it('isolates two sessions to different IPC directories', async () => {
+      it('isolates two sessions to different SQLite session rows', async () => {
         const sessionIdB = 'test-session-uuid-B'
         const sessionIpcDirB = path.join(ipcDir, sessionIdB)
         await fs.mkdir(sessionIpcDirB, { recursive: true })
 
-        // Add second slot to state
-        const statePath = path.join(tempDir, 'state.json')
-        const state = {
-          slots: {
-            1: {
-              sessionId,
-              projectName: 'project-A',
-              topicName: 'Project A',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            },
-            2: {
-              sessionId: sessionIdB,
-              projectName: 'project-B',
-              topicName: 'Project B',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            }
-          },
-          pendingStops: {}
+        // Add second session to SQLite
+        const dbResult = getDatabase()
+        expect(E.isRight(dbResult)).toBe(true)
+        if (E.isRight(dbResult)) {
+          insertSession(dbResult.right, sessionIdB, 2, 'project-B', new Date().toISOString())
         }
-        await fs.writeFile(statePath, JSON.stringify(state), 'utf-8')
 
         // Session A binds first
         const hookArgsA = {
@@ -366,42 +363,23 @@ describe('Hook Main Entry Point', () => {
         }
         await runHook(configPath, hookArgsB)()
 
-        // Verify: A bound to first slot's IPC dir, B to second
-        const boundA = await fs.readFile(path.join(sessionIpcDir, 'bound_session'), 'utf-8')
-        const boundB = await fs.readFile(path.join(sessionIpcDirB, 'bound_session'), 'utf-8')
-        expect(boundA).toBe('claude-sess-A')
-        expect(boundB).toBe('claude-sess-B')
+        // Verify: A bound to first session, B to second
+        expect(getClaudeSessionBinding('claude-sess-A')).toBe(sessionId)
+        expect(getClaudeSessionBinding('claude-sess-B')).toBe(sessionIdB)
       })
 
-      it('routes permission requests to correct session IPC dir', async () => {
+      it('routes permission requests to correct session', async () => {
         const sessionIdB = 'test-session-uuid-B'
         const sessionIpcDirB = path.join(ipcDir, sessionIdB)
         await fs.mkdir(sessionIpcDirB, { recursive: true })
 
-        const statePath = path.join(tempDir, 'state.json')
-        const state = {
-          slots: {
-            1: {
-              sessionId,
-              projectName: 'project-A',
-              topicName: 'Project A',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            },
-            2: {
-              sessionId: sessionIdB,
-              projectName: 'project-B',
-              topicName: 'Project B',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            }
-          },
-          pendingStops: {}
+        // Add second session and pre-bind session B in SQLite
+        const dbResult = getDatabase()
+        expect(E.isRight(dbResult)).toBe(true)
+        if (E.isRight(dbResult)) {
+          insertSession(dbResult.right, sessionIdB, 2, 'project-B', new Date().toISOString())
+          updateSessionBinding(dbResult.right, sessionIdB, 'claude-sess-B')
         }
-        await fs.writeFile(statePath, JSON.stringify(state), 'utf-8')
-
-        // Pre-bind session B
-        await fs.writeFile(path.join(sessionIpcDirB, 'bound_session'), 'claude-sess-B', 'utf-8')
 
         // Session B sends permission request
         const hookArgs = {
@@ -448,30 +426,13 @@ describe('Hook Main Entry Point', () => {
 
       it('auto-approves when multiple slots active but no session_id', async () => {
         const sessionIdB = 'test-session-uuid-B'
-        const sessionIpcDirB = path.join(ipcDir, sessionIdB)
-        await fs.mkdir(sessionIpcDirB, { recursive: true })
 
-        const statePath = path.join(tempDir, 'state.json')
-        const state = {
-          slots: {
-            1: {
-              sessionId,
-              projectName: 'project-A',
-              topicName: 'Project A',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            },
-            2: {
-              sessionId: sessionIdB,
-              projectName: 'project-B',
-              topicName: 'Project B',
-              activatedAt: new Date().toISOString(),
-              lastHeartbeat: new Date().toISOString(),
-            }
-          },
-          pendingStops: {}
+        // Add second session to SQLite
+        const dbResult = getDatabase()
+        expect(E.isRight(dbResult)).toBe(true)
+        if (E.isRight(dbResult)) {
+          insertSession(dbResult.right, sessionIdB, 2, 'project-B', new Date().toISOString())
         }
-        await fs.writeFile(statePath, JSON.stringify(state), 'utf-8')
 
         // No sessionId + multiple slots = can't route safely → auto-approve
         const hookArgs = {

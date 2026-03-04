@@ -16,12 +16,12 @@ import * as path from 'path'
 import * as os from 'os'
 import { stopEvent, keepAlive, sessionStart } from '../types/events'
 import { writeEvent, readResponse, writeResponse } from '../services/ipc-sqlite'
-import { writeQueuedInstruction, readQueuedInstruction, deleteQueuedInstruction } from '../services/queued-instruction'
+import { writeQueuedInstruction, readQueuedInstruction, deleteQueuedInstruction } from '../services/queued-instruction-sqlite'
 import { addPendingStop, removePendingStop, findPendingStopBySlot } from '../core/state'
 import { initialState, type PendingStop } from '../types/state'
 import { handleStopRequest } from '../hook/stop'
 import { openMemoryDatabase, closeDatabase, getDatabase } from '../services/db'
-import { insertResponse, ensureSessionForIpc } from '../services/db-queries'
+import { insertResponse, insertEvent, ensureSessionForIpc, insertPendingStop } from '../services/db-queries'
 
 // Mock daemon-health to avoid real daemon checks
 jest.mock('../services/daemon-health', () => ({
@@ -61,8 +61,17 @@ describe('Active Listening E2E', () => {
 
   describe('Stop event + queued instruction → response', () => {
     it('auto-injects queued instruction into response', async () => {
+      // 0. Set up SQLite: session + stop event + pending_stop (required for queued instructions)
+      const dbResult = getDatabase()
+      expect(E.isRight(dbResult)).toBe(true)
+      if (E.isRight(dbResult)) {
+        ensureSessionForIpc(dbResult.right, sessionId, 1)
+        insertEvent(dbResult.right, 'evt-e2e-1', sessionId, 'Stop', JSON.stringify({ _tag: 'Stop' }))
+        insertPendingStop(dbResult.right, 'evt-e2e-1', sessionId)
+      }
+
       // 1. Write a queued instruction (simulating message received while busy)
-      const writeResult = await writeQueuedInstruction(tempDir, 'fix the login bug')()
+      const writeResult = await writeQueuedInstruction(sessionDir, 'fix the login bug')()
       expect(E.isRight(writeResult)).toBe(true)
 
       // 2. Simulate what the daemon does: process a Stop event
@@ -75,19 +84,9 @@ describe('Active Listening E2E', () => {
       let state = addPendingStop(initialState, ps)
 
       // 3. Check for queued instruction (daemon logic)
-      const queuedResult = await readQueuedInstruction(tempDir)()
+      const queuedResult = await readQueuedInstruction(sessionDir)()
       expect(E.isRight(queuedResult)).toBe(true)
       if (E.isRight(queuedResult) && queuedResult.right !== null) {
-        // Ensure session exists for FK before writing response
-        const dbResult = getDatabase()
-        if (E.isRight(dbResult)) {
-          ensureSessionForIpc(dbResult.right, sessionId, 1)
-        }
-
-        // Write event first (response needs FK to event)
-        const event = stopEvent(ps.eventId, ps.slotNum, ps.lastMessage, sessionId)
-        await writeEvent(path.join(sessionDir, 'events.jsonl'), event)()
-
         // Write response with the queued instruction
         const responseResult = await writeResponse(sessionDir, ps.eventId, {
           instruction: queuedResult.right.text
@@ -95,12 +94,12 @@ describe('Active Listening E2E', () => {
         expect(E.isRight(responseResult)).toBe(true)
 
         // Delete the queued instruction
-        await deleteQueuedInstruction(tempDir)()
+        await deleteQueuedInstruction(sessionDir)()
         state = removePendingStop(state, ps.eventId)
       }
 
       // 4. Verify: response exists in SQLite with correct instruction
-      const response = await readResponse(tempDir, 'evt-e2e-1')()
+      const response = await readResponse(sessionDir, 'evt-e2e-1')()
       expect(E.isRight(response)).toBe(true)
       if (E.isRight(response)) {
         expect(response.right).not.toBeNull()
@@ -108,7 +107,7 @@ describe('Active Listening E2E', () => {
       }
 
       // 5. Verify: queued instruction was deleted
-      const queuedAfter = await readQueuedInstruction(tempDir)()
+      const queuedAfter = await readQueuedInstruction(sessionDir)()
       expect(E.isRight(queuedAfter)).toBe(true)
       if (E.isRight(queuedAfter)) {
         expect(queuedAfter.right).toBeNull()
@@ -203,31 +202,44 @@ describe('Active Listening E2E', () => {
     })
   })
 
-  describe('Message buffering when no pending stop', () => {
-    it('buffers message as queued instruction when Claude is busy', async () => {
-      // No pending stop exists — Claude is busy
+  describe('Message buffering via pending stop', () => {
+    it('buffers message as queued instruction on pending stop', async () => {
+      // Set up: session + event + pending_stop in SQLite
+      const dbResult = getDatabase()
+      expect(E.isRight(dbResult)).toBe(true)
+      if (E.isRight(dbResult)) {
+        ensureSessionForIpc(dbResult.right, sessionId, 1)
+        insertEvent(dbResult.right, 'evt-buf-1', sessionId, 'Stop', JSON.stringify({ _tag: 'Stop' }))
+        insertPendingStop(dbResult.right, 'evt-buf-1', sessionId)
+      }
 
       // Simulate incoming message → write queued instruction
-      const writeResult = await writeQueuedInstruction(tempDir, 'review PR #42')()
+      const writeResult = await writeQueuedInstruction(sessionDir, 'review PR #42')()
       expect(E.isRight(writeResult)).toBe(true)
 
       // Verify it's buffered
-      const readResult = await readQueuedInstruction(tempDir)()
+      const readResult = await readQueuedInstruction(sessionDir)()
       expect(E.isRight(readResult)).toBe(true)
       if (E.isRight(readResult)) {
         expect(readResult.right).not.toBeNull()
         expect(readResult.right!.text).toBe('review PR #42')
       }
-
-      // Later, when stop event arrives, it should be auto-injected
-      // (tested in the first test case above)
     })
 
     it('overwrites previous queued instruction with latest message', async () => {
-      await writeQueuedInstruction(tempDir, 'first message')()
-      await writeQueuedInstruction(tempDir, 'second message')()
+      // Set up: session + event + pending_stop in SQLite
+      const dbResult = getDatabase()
+      expect(E.isRight(dbResult)).toBe(true)
+      if (E.isRight(dbResult)) {
+        ensureSessionForIpc(dbResult.right, sessionId, 1)
+        insertEvent(dbResult.right, 'evt-buf-2', sessionId, 'Stop', JSON.stringify({ _tag: 'Stop' }))
+        insertPendingStop(dbResult.right, 'evt-buf-2', sessionId)
+      }
 
-      const readResult = await readQueuedInstruction(tempDir)()
+      await writeQueuedInstruction(sessionDir, 'first message')()
+      await writeQueuedInstruction(sessionDir, 'second message')()
+
+      const readResult = await readQueuedInstruction(sessionDir)()
       expect(E.isRight(readResult)).toBe(true)
       if (E.isRight(readResult)) {
         expect(readResult.right!.text).toBe('second message')

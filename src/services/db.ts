@@ -1,4 +1,4 @@
-import * as Database from 'better-sqlite3'
+import Database from 'better-sqlite3'
 import * as E from 'fp-ts/Either'
 import { DbError, connectionError } from '../types/db'
 
@@ -79,6 +79,10 @@ let db: Database.Database | null = null
 
 export const openDatabase = (dbPath: string): E.Either<DbError, Database.Database> => {
   try {
+    if (db) {
+      db.close()
+      db = null
+    }
     const instance = new Database(dbPath)
     instance.pragma('journal_mode = WAL')
     instance.pragma('busy_timeout = 5000')
@@ -114,6 +118,10 @@ export const getDatabase = (): E.Either<DbError, Database.Database> =>
 
 export const openMemoryDatabase = (): E.Either<DbError, Database.Database> => {
   try {
+    if (db) {
+      db.close()
+      db = null
+    }
     const instance = new Database(':memory:')
     instance.pragma('foreign_keys = ON')
     instance.exec(SCHEMA_SQL)

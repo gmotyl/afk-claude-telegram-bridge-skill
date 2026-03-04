@@ -22,15 +22,12 @@ chmod +x "$CONFIG_DIR/hook.js" 2>/dev/null || true
 export TELEGRAM_BRIDGE_CONFIG="$CONFIG_DIR"
 export AFK_CONFIG_PATH="$CONFIG_DIR/config.json"
 
-# Check if any AFK slots are active (hook.js resolves the exact session via binding)
-# NOTE: We no longer hardcode a specific slot here — session binding in hook.js
-# handles multi-session isolation by matching Claude Code's session_id to the
-# correct IPC directory via bound_session files.
-if [ -f "$CONFIG_DIR/state.json" ] && command -v node &> /dev/null; then
-  _STATE_FILE="$CONFIG_DIR/state.json"
-  _HAS_ACTIVE=$(node -e 'try { const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf-8")); const active = Object.values(s.slots || {}).filter(Boolean); if (active.length > 0) console.log("1"); } catch(e) {}' "$_STATE_FILE" 2>/dev/null)
+# Check if any AFK slots are active via SQLite bridge.db
+# hook.js resolves the exact session via session binding in the DB.
+# Use NODE_PATH so better-sqlite3 is found from the install directory's node_modules.
+if [ -f "$CONFIG_DIR/bridge.db" ] && command -v node &> /dev/null; then
+  _HAS_ACTIVE=$(NODE_PATH="$CONFIG_DIR/node_modules" node -e 'try { const D = require("better-sqlite3"); const db = new D(process.argv[1], { readonly: true }); const r = db.prepare("SELECT COUNT(*) as c FROM sessions").get(); if (r.c > 0) console.log("1"); db.close(); } catch(e) { process.stderr.write("[hook-wrapper] better-sqlite3 check failed: " + e.message + "\n"); }' "$CONFIG_DIR/bridge.db" 2>/dev/null)
   if [ -n "$_HAS_ACTIVE" ]; then
-    # Signal that AFK is active — hook.js will resolve the exact session
     export AFK_ACTIVE=1
   fi
 fi
@@ -38,23 +35,25 @@ fi
 # Handle special flags first (before stdin read)
 case "${1:-}" in
   --status)
-    # Show daemon status by reading state.json
-    if [ -f "$CONFIG_DIR/state.json" ]; then
+    # Show daemon status by reading bridge.db
+    if [ -f "$CONFIG_DIR/bridge.db" ] && command -v node &> /dev/null; then
       echo "AFK Bridge Status:"
-      echo "State file: $CONFIG_DIR/state.json"
-      # Try to parse and display active slots
-      if command -v jq &> /dev/null; then
-        jq '.slots | length' "$CONFIG_DIR/state.json" 2>/dev/null | {
-          read count
-          echo "Active slots: ${count:-0}"
-        }
+      echo "Database: $CONFIG_DIR/bridge.db"
+      _COUNT=$(NODE_PATH="$CONFIG_DIR/node_modules" node -e 'try { const D = require("better-sqlite3"); const db = new D(process.argv[1], { readonly: true }); const r = db.prepare("SELECT COUNT(*) as c FROM sessions").get(); console.log(r.c); db.close(); } catch(e) { console.log("0"); }' "$CONFIG_DIR/bridge.db" 2>/dev/null)
+      echo "Active sessions: ${_COUNT:-0}"
+      # Show daemon PID if alive
+      if [ -f "$CONFIG_DIR/daemon.pid" ]; then
+        _PID=$(cat "$CONFIG_DIR/daemon.pid" 2>/dev/null)
+        if [ -n "$_PID" ] && kill -0 "$_PID" 2>/dev/null; then
+          echo "Daemon PID: $_PID (alive)"
+        else
+          echo "Daemon PID: $_PID (dead)"
+        fi
       else
-        # Fallback if jq not available
-        grep -o '"slots"' "$CONFIG_DIR/state.json" > /dev/null 2>&1 && \
-          echo "State file exists with slots" || echo "State file error"
+        echo "Daemon: not running"
       fi
     else
-      echo "AFK Bridge not installed. Run: scripts/install-ts.sh"
+      echo "AFK Bridge not installed or no database. Run: bash install.sh"
       exit 1
     fi
     exit 0
@@ -71,48 +70,45 @@ case "${1:-}" in
     exec node "$CONFIG_DIR/cli.js" deactivate "$@"
     ;;
   --reset)
-    # Nuclear reset: kill daemons, delete Telegram topics, clear state, remove IPC dirs
+    # Nuclear reset: kill daemons, delete Telegram topics, delete bridge.db
     echo "Resetting AFK bridge..."
 
-    # Delete Telegram topics for active slots before clearing state
-    if [ -f "$CONFIG_DIR/config.json" ] && [ -f "$CONFIG_DIR/state.json" ]; then
+    # Delete Telegram topics from known_topics table in bridge.db
+    if [ -f "$CONFIG_DIR/config.json" ] && [ -f "$CONFIG_DIR/bridge.db" ]; then
       BOT_TOKEN=$(node -e 'try { const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf-8")); console.log(c.telegramBotToken || c.bot_token || ""); } catch(e) {}' "$CONFIG_DIR/config.json" 2>/dev/null)
       CHAT_ID=$(node -e 'try { const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf-8")); console.log(c.telegramGroupId || c.chat_id || ""); } catch(e) {}' "$CONFIG_DIR/config.json" 2>/dev/null)
       if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
-        THREAD_IDS=$(node -e 'try { const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf-8")); Object.values(s.slots || {}).forEach(slot => { if (slot && slot.threadId) console.log(slot.threadId); }); } catch(e) {}' "$CONFIG_DIR/state.json" 2>/dev/null)
+        # Read thread IDs from both known_topics and sessions tables
+        THREAD_IDS=$(NODE_PATH="$CONFIG_DIR/node_modules" node -e 'try { const D = require("better-sqlite3"); const db = new D(process.argv[1], { readonly: true }); const rows = db.prepare("SELECT DISTINCT thread_id FROM known_topics WHERE deleted_at IS NULL UNION SELECT DISTINCT thread_id FROM sessions WHERE thread_id IS NOT NULL").all(); rows.forEach(r => console.log(r.thread_id)); db.close(); } catch(e) {}' "$CONFIG_DIR/bridge.db" 2>/dev/null)
+        _DELETED=0
         for tid in $THREAD_IDS; do
+          [ -z "$tid" ] && continue
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/deleteForumTopic" \
             -H "Content-Type: application/json" \
             -d "{\"chat_id\":\"${CHAT_ID}\",\"message_thread_id\":${tid}}" > /dev/null 2>&1 \
-            && echo "Deleted Telegram topic $tid" || echo "Failed to delete topic $tid"
+            && echo "Deleted Telegram topic $tid" && _DELETED=$((_DELETED + 1)) || true
         done
-      fi
-    fi
-
-    # Kill daemon by PID from state.json (avoids killing unrelated node processes)
-    if [ -f "$CONFIG_DIR/state.json" ]; then
-      DAEMON_PID=$(node -e 'try { const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf-8")); if (s.daemon_pid) console.log(s.daemon_pid); } catch(e) {}' "$CONFIG_DIR/state.json" 2>/dev/null)
-      if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-        kill "$DAEMON_PID" 2>/dev/null && echo "Killed daemon process (PID $DAEMON_PID)" || echo "Failed to kill daemon PID $DAEMON_PID"
-      else
-        echo "No daemon running (PID ${DAEMON_PID:-unknown})"
+        [ "$_DELETED" -gt 0 ] && echo "Deleted $_DELETED Telegram topic(s)" || echo "No Telegram topics to delete"
       fi
     else
-      echo "No state.json found, skipping daemon kill"
+      echo "No Telegram topics to delete"
     fi
-    # Clear IPC directories
-    if [ -d "$CONFIG_DIR/ipc" ]; then
-      rm -rf "$CONFIG_DIR/ipc"
-      mkdir -p "$CONFIG_DIR/ipc"
-      echo "Cleared IPC directories"
+
+    # Kill daemon: pkill as safety net for all bridge.js processes
+    pkill -f "node.*bridge\.js" 2>/dev/null && echo "Killed bridge.js processes" || echo "No daemon running"
+
+    # Delete bridge.db (the single source of truth)
+    if [ -f "$CONFIG_DIR/bridge.db" ]; then
+      rm -f "$CONFIG_DIR/bridge.db" "$CONFIG_DIR/bridge.db-wal" "$CONFIG_DIR/bridge.db-shm"
+      echo "Deleted bridge.db"
     fi
-    # Reset state.json
-    echo '{"slots":{}}' > "$CONFIG_DIR/state.json"
-    echo "Reset state.json"
+    # Clean up PID file and legacy files
+    rm -f "$CONFIG_DIR/daemon.pid" "$CONFIG_DIR/daemon.heartbeat" "$CONFIG_DIR/state.json" "$CONFIG_DIR/known_topics.jsonl" 2>/dev/null
+    rm -rf "$CONFIG_DIR/ipc" 2>/dev/null
     # Clear daemon log
     > "$CONFIG_DIR/daemon.log" 2>/dev/null
     echo "Cleared daemon.log"
-    echo "AFK bridge reset complete. Use --activate to start fresh."
+    echo "AFK bridge reset complete. Use /afk to start fresh."
     exit 0
     ;;
   --setup)
@@ -161,40 +157,9 @@ if [ -z "$SESSION_ID" ]; then
   exit 0
 fi
 
-# Session gating: only proceed if this session is bound or can be bound
-# (prevents non-AFK sessions from leaking into the bridge)
-IPC_DIR="$CONFIG_DIR/ipc"
-if [ -d "$IPC_DIR" ]; then
-  # Check if session_id directly matches an IPC dir (AFK session itself)
-  if [ -d "$IPC_DIR/$SESSION_ID" ]; then
-    : # Direct match — this IS the AFK session
-  else
-    # Check if this session is already bound to an IPC dir
-    _BOUND=""
-    _UNBOUND_COUNT=0
-    for _dir in "$IPC_DIR"/*/; do
-      [ -d "$_dir" ] || continue
-      if [ -f "${_dir}bound_session" ]; then
-        _CONTENT=$(cat "${_dir}bound_session" 2>/dev/null)
-        if [ "$_CONTENT" = "$SESSION_ID" ]; then
-          _BOUND=1
-          break
-        fi
-      else
-        _UNBOUND_COUNT=$((_UNBOUND_COUNT + 1))
-      fi
-    done
-
-    if [ -z "$_BOUND" ]; then
-      # Not bound — proceed if at least 1 unbound slot exists (to bind on first contact).
-      # The stop hook clears bound_session when delivering an instruction because
-      # Claude Code may change session_id between the Stop and subsequent PreToolUse hooks.
-      if [ "$_UNBOUND_COUNT" -lt 1 ]; then
-        exit 0
-      fi
-    fi
-  fi
-else
+# Session gating: only proceed if bridge.db exists and has active sessions
+# (hook.js handles detailed session binding via SQLite)
+if [ ! -f "$CONFIG_DIR/bridge.db" ]; then
   exit 0
 fi
 

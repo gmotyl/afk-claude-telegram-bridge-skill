@@ -20,10 +20,10 @@ import {
   updatePendingStopMessageId,
   StateError
 } from '../core/state'
-import { loadState, saveState } from '../services/state-persistence'
+import { loadState } from '../services/state-persistence-sqlite'
 import { readAllUnprocessedEvents, markEventDone, writeResponse } from '../services/ipc-sqlite'
-import { readQueuedInstruction, deleteQueuedInstruction } from '../services/queued-instruction'
-import { openDatabase, closeDatabase } from '../services/db'
+import { openDatabase, closeDatabase, getDatabase } from '../services/db'
+import { listActiveSessions, updateSessionThreadId, insertKnownTopic, insertPendingStop as dbInsertPendingStop, deletePendingStop as dbDeletePendingStop } from '../services/db-queries'
 import {
   createForumTopic,
   deleteForumTopic,
@@ -83,6 +83,8 @@ interface DaemonRuntime {
   approvalCounts: Map<string, number>
   /** Sessions that have been trusted (auto-approve all future requests) */
   trustedSessions: Set<string>
+  /** Per-slot queued instructions (message arrived before Stop event) */
+  queuedInstructions: Map<number, string>
 }
 
 // ============================================================================
@@ -184,6 +186,13 @@ const processEventSideEffects = async (
             slots: { ...state.slots, [event.slotNum]: updatedSlot }
           }
 
+          // Persist threadId to SQLite so it survives daemon restarts
+          const dbResult = getDatabase()
+          if (E.isRight(dbResult)) {
+            updateSessionThreadId(dbResult.right, slot.sessionId, threadId)
+            insertKnownTopic(dbResult.right, threadId, slot.topicName)
+          }
+
           // Send activation message
           await sendMessageToTopic(
             token, chatId,
@@ -240,6 +249,15 @@ const processEventSideEffects = async (
       stopTyping(runtime, event.slotNum)
       const slot = state.slots[event.slotNum]
       console.log(`[side-effect] Stop event ${event.eventId.slice(0,8)} for slot ${event.slotNum}, threadId=${slot?.threadId}`)
+
+      // Persist pending_stop to SQLite
+      if (event.sessionId) {
+        const dbResult = getDatabase()
+        if (E.isRight(dbResult)) {
+          dbInsertPendingStop(dbResult.right, event.eventId, event.sessionId)
+        }
+      }
+
       if (!slot?.threadId) return state
 
       // Don't re-process stops we've already handled
@@ -380,19 +398,25 @@ const handleStopEventSideEffects = async (
   for (const ps of Object.values(currentState.pendingStops)) {
     const sessionIpcDir = getSessionIpcDir(config, currentState, ps.slotNum)
 
-    // Check for queued instruction
-    const queuedResult = await readQueuedInstruction(sessionIpcDir)()
+    // Check for queued instruction in runtime memory
+    const queuedText = runtime.queuedInstructions.get(ps.slotNum)
 
-    if (E.isRight(queuedResult) && queuedResult.right !== null) {
-      const queued = queuedResult.right
-      console.log(`[auto-inject] Found queued instruction for slot ${ps.slotNum}, eventId=${ps.eventId.slice(0,8)}: "${queued.text.slice(0,50)}"`)
+    if (queuedText) {
+      console.log(`[auto-inject] Found queued instruction for slot ${ps.slotNum}, eventId=${ps.eventId.slice(0,8)}: "${queuedText.slice(0,50)}"`)
       const writeResult = await writeResponse(sessionIpcDir, ps.eventId, {
-        instruction: queued.text
+        instruction: queuedText
       })()
 
       if (E.isRight(writeResult)) {
-        await deleteQueuedInstruction(sessionIpcDir)()
+        runtime.queuedInstructions.delete(ps.slotNum)
         currentState = removePendingStop(currentState, ps.eventId)
+
+        // Clean up SQLite pending_stop row
+        const dbResult = getDatabase()
+        if (E.isRight(dbResult)) {
+          dbDeletePendingStop(dbResult.right, ps.eventId)
+        }
+
         startTyping(runtime, ps.slotNum)
 
         // Verbose: confirm auto-injection
@@ -631,6 +655,13 @@ const processIncomingMessage = async (
 
     if (E.isRight(writeResult)) {
       startTyping(runtime, slotNum)
+
+      // Clean up SQLite pending_stop row
+      const dbResult = getDatabase()
+      if (E.isRight(dbResult)) {
+        dbDeletePendingStop(dbResult.right, pendingStop.eventId)
+      }
+
       // Verbose: confirm delivery in topic
       if (slot?.verbose && slot.threadId) {
         await sendMessageToTopic(
@@ -645,10 +676,9 @@ const processIncomingMessage = async (
     return state
   }
 
-  // No pending stop — buffer as queued instruction
+  // No pending stop — buffer as queued instruction in runtime memory
   console.log(`[telegram] No pendingStop for slot ${slotNum}, queuing: "${text.slice(0,50)}"`)
-  const { writeQueuedInstruction } = await import('../services/queued-instruction')
-  await writeQueuedInstruction(sessionIpcDir, text)()
+  runtime.queuedInstructions.set(slotNum, text)
 
   // Verbose: confirm queuing in topic
   if (slot?.verbose && slot.threadId) {
@@ -846,22 +876,25 @@ const pollAndRouteUpdates = async (
 // ============================================================================
 
 /**
- * Remove slots whose IPC session directory no longer exists.
- * This handles the case where deactivate removes the IPC dir but the
+ * Remove slots whose session no longer exists in the SQLite database.
+ * This handles the case where deactivate deletes the session row but the
  * daemon's in-memory state still has the slot.
  *
  * Exported for testing.
  */
-export const cleanupOrphanedSlots = async (config: Config, state: State): Promise<State> => {
+export const cleanupOrphanedSlots = async (_config: Config, state: State): Promise<State> => {
+  const dbResult = getDatabase()
+  if (E.isLeft(dbResult)) return state
+
+  const sessionsResult = listActiveSessions(dbResult.right)
+  if (E.isLeft(sessionsResult)) return state
+
+  const activeSessionIds = new Set(sessionsResult.right.map(s => s.id))
   let currentState = state
 
   for (const [key, slot] of Object.entries(currentState.slots)) {
     if (!slot) continue
-    const sessionDir = path.join(config.ipcBaseDir, slot.sessionId)
-    try {
-      await fs.access(sessionDir)
-    } catch {
-      // IPC dir gone — slot is orphaned
+    if (!activeSessionIds.has(slot.sessionId)) {
       const slotNum = parseInt(key, 10)
       console.log(`Cleaning orphaned slot ${slotNum} (session ${slot.sessionId})`)
       currentState = removeSlot(currentState, slotNum)
@@ -882,7 +915,6 @@ const runDaemonIteration = (
   config: Config,
   state: State,
   runtime: DaemonRuntime,
-  stateFilePath: string,
   lastCleanupTime: Date,
   cleanupIntervalMs: number
 ): TE.TaskEither<DaemonError, { state: State; lastCleanupTime: Date }> => {
@@ -912,15 +944,23 @@ const runDaemonIteration = (
       const timeSinceCleanup = now.getTime() - lastCleanupTime.getTime()
 
       if (timeSinceCleanup >= cleanupIntervalMs) {
+        const preCleanupSlots = new Set(
+          Object.keys(currentState.slots).filter(k => currentState.slots[parseInt(k, 10)])
+        )
         currentState = cleanupStaleSlots(currentState, config.sessionTimeout, now)
         currentState = await cleanupOrphanedSlots(config, currentState)
+
+        // Stop typing for any slots removed during cleanup
+        for (const key of preCleanupSlots) {
+          const slotNum = parseInt(key, 10)
+          if (!currentState.slots[slotNum]) {
+            stopTyping(runtime, slotNum)
+          }
+        }
       }
 
-      // 4. Save state
-      const saveResult = await saveState(stateFilePath, currentState)()
-      if (E.isLeft(saveResult)) {
-        console.error('Error saving state:', saveResult.left)
-      }
+      // State is persisted through individual SQLite operations;
+      // no need to write state.json (saveState is a no-op in SQLite mode)
 
       return {
         state: currentState,
@@ -962,9 +1002,8 @@ export const startDaemon = (configPath: string): TE.TaskEither<DaemonError, Stop
       }
       console.log(`SQLite database opened at ${dbPath}`)
 
-      // State file lives alongside config.json (not inside ipcBaseDir)
-      const stateFilePath = path.join(configDir, 'state.json')
-      const stateResult = await loadState(stateFilePath)()
+      // Load state from SQLite (reconstructs from sessions + pending_stops tables)
+      const stateResult = await loadState('')()
 
       let state: State = initialState
       if (E.isRight(stateResult)) {
@@ -977,7 +1016,6 @@ export const startDaemon = (configPath: string): TE.TaskEither<DaemonError, Stop
         sessionTimeout: config.sessionTimeout,
         ipcBaseDir: config.ipcBaseDir,
         configDir,
-        stateFilePath
       })
       console.log('Initial slots:', Object.values(state.slots).filter(Boolean).length)
 
@@ -993,7 +1031,8 @@ export const startDaemon = (configPath: string): TE.TaskEither<DaemonError, Stop
         permissionBatches: new Map(),
         pendingBatches: new Map(),
         approvalCounts: new Map(),
-        trustedSessions: new Set()
+        trustedSessions: new Set(),
+        queuedInstructions: new Map()
       }
 
       // Write initial heartbeat immediately so hooks can verify startup
@@ -1017,7 +1056,6 @@ export const startDaemon = (configPath: string): TE.TaskEither<DaemonError, Stop
             config,
             currentState,
             runtime,
-            stateFilePath,
             lastCleanupTime,
             30 * 1000
           )()
@@ -1045,12 +1083,6 @@ export const startDaemon = (configPath: string): TE.TaskEither<DaemonError, Stop
           async () => {
             running = false
             clearInterval(loopInterval)
-
-            const finalResult = await saveState(stateFilePath, currentState)()
-
-            if (E.isLeft(finalResult)) {
-              throw finalResult
-            }
 
             // Close SQLite database
             closeDatabase()

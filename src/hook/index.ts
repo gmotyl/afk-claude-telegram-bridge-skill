@@ -26,8 +26,8 @@ import { requestPermission, type PermissionResponse } from './permission'
 import { handleStopRequest, type StopDecision } from './stop'
 import { loadConfig } from '../core/config'
 import { Config } from '../types/config'
-import { loadState } from '../services/state-persistence'
-import { findBoundSession, findUnboundSession, bindSession } from '../services/session-binding'
+import { loadState } from '../services/state-persistence-sqlite'
+import { findBoundSession, findUnboundSession, bindSession } from '../services/session-binding-sqlite'
 import { ensureDaemonAlive } from '../services/daemon-health'
 import { openDatabase, closeDatabase } from '../services/db'
 import { type HookError, hookError } from '../types/errors'
@@ -51,7 +51,7 @@ interface ResolvedSession {
 /**
  * Resolve which AFK session this hook call belongs to.
  *
- * Uses session binding (bound_session files in IPC dirs) to map
+ * Uses session binding (SQLite sessions.claude_session_id) to map
  * Claude Code's session_id to the correct AFK session.
  *
  * @param ipcBaseDir - Base IPC directory
@@ -89,18 +89,20 @@ const resolveSession = async (
     }
   }
 
-  // Fallback: if only one slot is active and no session_id available, use it
-  // (backwards compatibility for CLI args mode)
-  const activeSlots = Object.entries(slots).filter(([, s]) => s !== undefined)
-  if (activeSlots.length === 1 && activeSlots[0]) {
-    const [slotKey, slot] = activeSlots[0]
-    return {
-      sessionId: slot!.sessionId,
-      slotNum: parseInt(slotKey, 10)
+  // Fallback: only when no session_id available (CLI args mode)
+  // If we had a claudeSessionId but it didn't match, return null — this
+  // session is NOT an AFK session and should not be routed through the bridge.
+  if (!claudeSessionId) {
+    const activeSlots = Object.entries(slots).filter(([, s]) => s !== undefined)
+    if (activeSlots.length === 1 && activeSlots[0]) {
+      const [slotKey, slot] = activeSlots[0]
+      return {
+        sessionId: slot!.sessionId,
+        slotNum: parseInt(slotKey, 10)
+      }
     }
   }
 
-  // Multiple slots active but no session_id — can't route safely
   return null
 }
 
@@ -416,6 +418,9 @@ const main = async (): Promise<void> => {
   }
 
   const result = await runHook(configPath, argsOrHookArgs)()
+
+  // Always close SQLite database before exiting
+  closeDatabase()
 
   if (E.isLeft(result)) {
     const error = result.left

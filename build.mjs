@@ -24,6 +24,7 @@ await Promise.all(
       platform: 'node',
       target: 'node18',
       outfile,
+      external: ['better-sqlite3'],
     }).then(() => addShebang(outfile))
   )
 )

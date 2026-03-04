@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.0] — SQLite IPC (2026-03-04)
+
+Replace file-based IPC with SQLite for reliability and atomicity.
+
+### Added
+
+- **SQLite database layer** — `better-sqlite3` with WAL mode, busy timeout, and schema versioning
+- **Typed query helpers** for all tables (sessions, events, responses, permission_batches, pending_stops, known_topics)
+- **SQLite-backed service adapters** — drop-in replacements for file-based IPC, session binding, state persistence, and queued instructions
+- **Known topics tracking** — daemon registers created Telegram topics in `known_topics` table so `/afk-reset` can clean them up
+
+### Changed
+
+- **IPC mechanism** — events and responses now stored in SQLite tables instead of JSONL files and response JSON files
+- **Session binding** — uses `claude_session_id` column in sessions table instead of `bound_session` files
+- **State persistence** — reconstructed from SQLite tables on daemon start instead of lockfile-protected `state.json`
+- **Hook session routing** — non-AFK sessions are no longer incorrectly routed through the bridge when only one slot is active
+- **Thread ID persistence** — `threadId` from Telegram topic creation is now persisted to SQLite, surviving daemon restarts
+- **Hook wrapper** (`hook.sh`) simplified — session gating delegated to `hook.js` via SQLite queries
+- **Reset command** reads thread IDs from both `known_topics` and `sessions` tables for reliable topic cleanup
+
+### Removed
+
+- File-based IPC services (`ipc.ts`, `session-binding.ts`, `state-persistence.ts`, `queued-instruction.ts`, `file-lock.ts`, `instruction-writer.ts`)
+- `proper-lockfile` dependency (SQLite handles concurrency)
+
+### Fixed
+
+- `better-sqlite3` import — changed from `import * as` (namespace) to default import to fix "is not a constructor" error in minified bundles
+- Session leak — other Claude sessions no longer get routed through AFK bridge when they don't match any bound session
+- Topic cleanup on reset — topics are now tracked in `known_topics` table and properly deleted
+- Dual daemon — activate now persists daemon PID to `state.json` so hooks don't spawn a second daemon
+- Duplicate topics — caused by dual daemons both processing the same SessionStart event
+
 ## [2.1.0] — Permission Batching, Session Trust & Config Auto-approve (2026-03-01)
 
 ### Added

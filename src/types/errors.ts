@@ -195,7 +195,9 @@ export const daemonStopError = (message: string): DaemonStopError => ({
 // Bridge Error (Union of all error types)
 // ============================================================================
 
-export type BridgeError = IpcError | TelegramError | BusinessError
+export type DbError = import('./db').DbError
+
+export type BridgeError = IpcError | TelegramError | BusinessError | DbError
 
 // ============================================================================
 // Error Message Generation (for logging/response)
@@ -231,6 +233,14 @@ export const errorMessage = (error: BridgeError): string => {
       return `Daemon spawn error: ${error.message}`
     case 'DaemonStopError':
       return `Daemon stop error: ${error.message}`
+    case 'ConnectionError':
+      return `DB connection error: ${error.message}`
+    case 'QueryError':
+      return `DB query error: ${error.message} (query: ${error.query})`
+    case 'ConstraintError':
+      return `DB constraint violation: ${error.constraint}`
+    case 'BusyError':
+      return `DB busy, retry after ${error.retryAfterMs}ms`
   }
 }
 
@@ -262,5 +272,11 @@ export const errorStatusCode = (error: BridgeError): number => {
       return 500
     case 'DaemonStopError':
       return 500
+    case 'ConnectionError':
+    case 'QueryError':
+    case 'ConstraintError':
+      return 500
+    case 'BusyError':
+      return 503
   }
 }

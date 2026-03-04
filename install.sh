@@ -64,6 +64,24 @@ chmod +x "$INSTALL_DIR/hook.js" "$INSTALL_DIR/bridge.js" "$INSTALL_DIR/cli.js" "
 
 echo "Core files installed to $INSTALL_DIR"
 
+# --- Install native dependency (better-sqlite3 is externalized from bundle) ---
+if [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/node_modules/better-sqlite3" ]; then
+  # Local clone: symlink node_modules/better-sqlite3 for native addon
+  mkdir -p "$INSTALL_DIR/node_modules"
+  rm -rf "$INSTALL_DIR/node_modules/better-sqlite3" "$INSTALL_DIR/node_modules/bindings" "$INSTALL_DIR/node_modules/file-uri-to-path" "$INSTALL_DIR/node_modules/prebuild-install"
+  ln -sf "$SCRIPT_DIR/node_modules/better-sqlite3" "$INSTALL_DIR/node_modules/better-sqlite3"
+  # better-sqlite3 depends on bindings and file-uri-to-path at runtime
+  [ -d "$SCRIPT_DIR/node_modules/bindings" ] && ln -sf "$SCRIPT_DIR/node_modules/bindings" "$INSTALL_DIR/node_modules/bindings"
+  [ -d "$SCRIPT_DIR/node_modules/file-uri-to-path" ] && ln -sf "$SCRIPT_DIR/node_modules/file-uri-to-path" "$INSTALL_DIR/node_modules/file-uri-to-path"
+  echo "Linked better-sqlite3 native module"
+else
+  # Remote install: install better-sqlite3 directly in hook dir
+  echo "Installing better-sqlite3 native module..."
+  (cd "$INSTALL_DIR" && npm init -y > /dev/null 2>&1 && npm install better-sqlite3 --no-save > /dev/null 2>&1) || {
+    echo "WARNING: Failed to install better-sqlite3. Run: cd $INSTALL_DIR && npm install better-sqlite3" >&2
+  }
+fi
+
 # --- Install /afk and /back commands ---
 COMMANDS_DIR="$GLOBAL_BASE/commands"
 mkdir -p "$COMMANDS_DIR"
@@ -80,10 +98,10 @@ fi
 
 echo "Commands installed: /afk, /back, /afk-reset"
 
-# --- Initialize state.json if missing ---
-if [ ! -f "$INSTALL_DIR/state.json" ]; then
-  echo '{"slots":{}}' > "$INSTALL_DIR/state.json"
-  echo "Created state.json"
+# --- Clean up legacy state.json (replaced by bridge.db) ---
+if [ -f "$INSTALL_DIR/state.json" ]; then
+  rm -f "$INSTALL_DIR/state.json"
+  echo "Removed legacy state.json (replaced by SQLite bridge.db)"
 fi
 
 # --- Register hooks in settings.json ---
