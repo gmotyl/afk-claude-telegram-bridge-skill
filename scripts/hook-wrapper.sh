@@ -164,5 +164,7 @@ if [ ! -f "$CONFIG_DIR/bridge.db" ]; then
 fi
 
 # Pipe the saved stdin to hook.js
+# NODE_PATH ensures better-sqlite3 (external native module) is found
+export NODE_PATH="$CONFIG_DIR/node_modules"
 echo "$INPUT" | "$CONFIG_DIR/hook.js" "$@"
 exit $?

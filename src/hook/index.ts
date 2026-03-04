@@ -146,7 +146,16 @@ export const runHook = (
       const dbResult = openDatabase(dbPath)
       if (E.isLeft(dbResult)) {
         console.error(`[hook] Failed to open SQLite database: ${String(dbResult.left)}`)
-        // Fall through — hook can still work without SQLite (auto-approve)
+        // Without DB, we can't resolve sessions — auto-approve permissions, let stop proceed
+        if (hookArgs.type === 'permission_request') {
+          process.stdout.write(JSON.stringify({
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              permissionDecision: 'allow',
+            }
+          }))
+        }
+        return 0
       }
 
       // Step 3: Resolve session via binding
@@ -154,10 +163,12 @@ export const runHook = (
 
       // Use session_id from hookArgs (stdin JSON) or env fallback
       const claudeSessionId = hookArgs.sessionId || process.env.CLAUDE_SESSION_ID
+      console.error(`[hook] Resolving session for claude_session_id=${claudeSessionId?.slice(0,8) ?? 'none'}, type=${hookArgs.type}`)
       const resolved = await resolveSession(config.ipcBaseDir, statePath, claudeSessionId)
 
       // If no resolved session, auto-approve (no active AFK)
       if (!resolved) {
+        console.error(`[hook] No resolved session — ${hookArgs.type === 'stop' ? 'letting stop proceed' : 'auto-approving'}`)
         if (hookArgs.type === 'permission_request') {
           // Auto-approve: output allow decision
           process.stdout.write(JSON.stringify({
