@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.1.0] — Drop Native Dependencies (2026-03-12)
+
+Replace `better-sqlite3` (native C++ addon) with Node.js built-in `node:sqlite` module to eliminate version-dependent build failures.
+
+### Added
+
+- **Marker file gate** (`active_count`) — hook.sh gate check is now pure bash (no node invocation on hot path)
+- **Stale session detection** — if daemon PID is dead and heartbeat is older than 15 minutes, marker resets automatically
+- **Node.js version check** in `install.sh` — fails early with clear message if Node < 22.5
+
+### Changed
+
+- **SQLite driver** — `better-sqlite3` → `node:sqlite` (built-in since Node 22.5+)
+- **Minimum Node.js version** — 18+ → 22.5+
+- **hook.sh** — gate check reads marker file instead of spawning node to query SQLite; `--status` and `--reset` use `node:sqlite` instead of `better-sqlite3`
+- **`@types/node`** upgraded to v25 for `node:sqlite` type declarations
+
+### Removed
+
+- `better-sqlite3` dependency (native C++ addon that broke on Node.js version upgrades)
+- `@types/better-sqlite3` dev dependency
+- `NODE_PATH` exports from all shell scripts
+- `node_modules` symlink/install in `install.sh`
+
 ## [3.0.0] — SQLite IPC (2026-03-04)
 
 Replace file-based IPC with SQLite for reliability and atomicity.

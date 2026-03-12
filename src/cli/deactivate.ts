@@ -16,6 +16,7 @@ import { stopDaemon, isDaemonAlive } from '../services/daemon-launcher'
 import { sendMessageToTopic, deleteForumTopic } from '../services/telegram'
 import { openDatabase, getDatabase } from '../services/db'
 import { deleteSession } from '../services/db-queries'
+import { decrementActiveCount } from '../services/marker'
 
 const readDaemonPidFromFile = async (configDir: string): Promise<number | null> => {
   try {
@@ -87,6 +88,7 @@ export const deactivate = (
       const dbRef = getDatabase()
       if (E.isRight(dbRef)) {
         deleteSession(dbRef.right, slotSessionId)
+        decrementActiveCount(configDir)
       }
 
       // 5. Check if any slots remain after deletion
