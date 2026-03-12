@@ -19,6 +19,7 @@ import { startDaemon, isDaemonAlive } from '../services/daemon-launcher'
 import { updateDaemonPidInState } from '../services/daemon-health'
 import { openDatabase, getDatabase } from '../services/db'
 import { insertSession, deleteSession, updateSessionThreadId } from '../services/db-queries'
+import { incrementActiveCount } from '../services/marker'
 
 export interface ActivateResult {
   readonly slotNum: number
@@ -127,6 +128,7 @@ export const activate = (
         if (reattachThreadId !== undefined) {
           updateSessionThreadId(dbRef.right, sessionId, reattachThreadId)
         }
+        incrementActiveCount(configDir)
       }
 
       // 7. Write SessionStart event to SQLite
